@@ -227,9 +227,10 @@ fi
 TLS_FAIL_CONFIG_UPDATE_FILE="/run/pgbouncer/.fail-tls-config-update"
 TLS_FAIL_RELOAD_FILE="/run/pgbouncer/.fail-tls-reload"
 # TLS_FAIL_BACKUP_FILE / TLS_FAIL_ENDPOINT_FILE / TLS_FAIL_INSTALL_FILE
-# defaults live in lib/tls.sh (consumed there); TLS_FAIL_PROTOCOLS_FILE
-# is consumed below.
+# defaults live in lib/tls.sh (consumed there); the remaining flags are
+# consumed below. All are test-only, absent by default, never secrets.
 TLS_FAIL_PROTOCOLS_FILE="/run/pgbouncer/.fail-tls-protocols"
+TLS_FAIL_ROLLBACK_FILE="/run/pgbouncer/.fail-tls-rollback"
 # Sentinel value injected into the rewritten config while the protocols
 # fault flag is present. PgBouncer 1.25.2 rejects it at RELOAD while
 # keeping the previous TLS context (verified live), which deterministically
@@ -1114,13 +1115,10 @@ start_pgbouncer() {
   echo "Starting $* (pid ${PGBOUNCER_PID})..." >&2
 }
 
-# SIGHUP PgBouncer via pid file (usable from the watcher subshell).
-# Returns nonzero when delivery fails. Honors the test-only fault flag
-# to simulate a reload failure for fail-closed retry tests.
-reload_pgbouncer() {
-  if [ -f "${TLS_FAIL_RELOAD_FILE:-/run/pgbouncer/.fail-tls-reload}" ]; then
-    return 1
-  fi
+# Deliver SIGHUP to the supervised PgBouncer via the pid file (usable
+# from the watcher subshell). Returns nonzero when delivery fails, in
+# which case no successful reload may be assumed by the caller.
+_deliver_sighup_to_pgbouncer() {
   _r_pid=""
   if [ -f "${PGBOUNCER_PID_FILE}" ]; then
     _r_pid=$(tr -d ' \n' < "${PGBOUNCER_PID_FILE}" 2>/dev/null || printf '')
@@ -1136,6 +1134,115 @@ reload_pgbouncer() {
     return 0
   fi
   return 1
+}
+
+# SIGHUP PgBouncer for activation/renewal. Honors the test-only fault
+# flag to simulate a reload failure for fail-closed retry tests.
+reload_pgbouncer() {
+  if [ -f "${TLS_FAIL_RELOAD_FILE:-/run/pgbouncer/.fail-tls-reload}" ]; then
+    return 1
+  fi
+  _deliver_sighup_to_pgbouncer
+}
+
+# SIGHUP PgBouncer for an explicit rollback reload. Honors a separate
+# test-only fault flag so rollback delivery failure is independently
+# deterministic from forward reload failure.
+reload_pgbouncer_rollback() {
+  if [ -f "${TLS_FAIL_ROLLBACK_FILE:-/run/pgbouncer/.fail-tls-rollback}" ]; then
+    return 1
+  fi
+  _deliver_sighup_to_pgbouncer
+}
+
+# Stop this container after an unverifiable rollback: kill the supervised
+# PgBouncer (if any) so the supervisor exits nonzero instead of serving
+# or advertising a state that was never externally verified. Never
+# publishes any state itself.
+abort_container_after_unverified_rollback() {
+  _k_pid=""
+  if [ -f "${PGBOUNCER_PID_FILE}" ]; then
+    _k_pid=$(tr -d ' \n' < "${PGBOUNCER_PID_FILE}" 2>/dev/null || printf '')
+  fi
+  case "${_k_pid}" in
+    ''|*[!0-9]*) _k_pid="" ;;
+  esac
+  if [ -n "${_k_pid}" ] && kill -0 "${_k_pid}" 2>/dev/null; then
+    kill -TERM "${_k_pid}" 2>/dev/null || true
+  else
+    kill -TERM 1 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Confirm a prefer rollback: the process is alive and the endpoint serves
+# no candidate certificate (plaintext again). Raw observation, never
+# fault-flaggable: this is the ground truth the rollback claims.
+# Args: port host. Bounded retries for the async reload to settle.
+confirm_plaintext_rollback() {
+  _c_port="${1:-5432}"
+  _c_host="${2:-localhost}"
+  _c_try=0
+  while [ "${_c_try}" -lt 4 ]; do
+    if pgbouncer_pid_alive; then
+      _c_served=""
+      _c_served=$(served_frontend_leaf_fp "${_c_port}" "${_c_host}" 2>/dev/null || printf '')
+      if [ -z "${_c_served}" ]; then
+        return 0
+      fi
+    fi
+    sleep 1 2>/dev/null || true
+    _c_try=$((_c_try + 1))
+  done
+  return 1
+}
+
+# Confirm a renewal rollback: the process is alive and the endpoint
+# serves the restored runtime leaf again. Raw observation, never
+# fault-flaggable. Args: port host. Bounded retries for settle.
+confirm_renewal_rollback() {
+  _rr_port="${1:-5432}"
+  _rr_host="${2:-localhost}"
+  _rr_try=0
+  while [ "${_rr_try}" -lt 4 ]; do
+    if pgbouncer_pid_alive; then
+      _rr_expected=""
+      _rr_expected=$(runtime_leaf_fingerprint "${TLS_RUNTIME_CERT}" 2>/dev/null || printf '')
+      _rr_served=""
+      _rr_served=$(served_frontend_leaf_fp "${_rr_port}" "${_rr_host}" 2>/dev/null || printf '')
+      if [ -n "${_rr_expected}" ] && [ -n "${_rr_served}" ] && [ "${_rr_served}" = "${_rr_expected}" ]; then
+        return 0
+      fi
+    fi
+    sleep 1 2>/dev/null || true
+    _rr_try=$((_rr_try + 1))
+  done
+  return 1
+}
+
+# Roll back an ambiguous prefer activation to confirmed plaintext:
+# realign config to disable, verify it, reload, and confirm the endpoint
+# no longer serves the candidate. Returns 0 only on confirmed rollback.
+rollback_prefer_to_plaintext() {
+  _rp_port="${1:-5432}"
+  _rp_host="${2:-localhost}"
+  downgrade_config_tls_to_disable || return 1
+  verify_frontend_tls_disabled_config "${PG_CONFIG_FILE}" 2>/dev/null || return 1
+  reload_pgbouncer_rollback || return 1
+  confirm_plaintext_rollback "${_rp_port}" "${_rp_host}" || return 1
+  return 0
+}
+
+# Roll back an ambiguous renewal to the restored previous pair:
+# reload the restored files and confirm the endpoint serves them again.
+# Returns 0 only on confirmed rollback. Call only after
+# restore_runtime_cert_backup.
+rollback_renewal_to_previous() {
+  _rn_port="${1:-5432}"
+  _rn_host="${2:-localhost}"
+  reload_pgbouncer_rollback || return 1
+  confirm_renewal_rollback "${_rn_port}" "${_rn_host}" || return 1
+  return 0
 }
 
 # True when the supervised PgBouncer process (pid file) is alive.
@@ -1269,28 +1376,45 @@ cert_watcher() {
         continue
       fi
       echo "Frontend TLS certificate changed; reloading PgBouncer" >&2
-      # The reload is processed asynchronously; pause briefly so the
-      # endpoint probe does not race the config switch.
-      if reload_pgbouncer && sleep 2 2>/dev/null && verify_frontend_tls_endpoint "${_W_PORT}" "${_W_HOST}"; then
-        clear_runtime_cert_backup || true
-        FRONTEND_TLS_STATE="active"
-        FRONTEND_TLS_ACTIVE=1
-        EXPECT_PGBOUNCER=1
-        write_state_file || true
-        render_ui || true
-        if ! commit_applied_fingerprint "${_W_SRC_CERT}" "${_W_SRC_KEY}"; then
-          echo "TLS setup: failed to record applied certificate for ${PUBLIC_HOST_SANITIZED}; will retry." >&2
-          continue
+      if reload_pgbouncer; then
+        echo "Frontend TLS reload delivered; verifying live endpoint" >&2
+        if verify_frontend_tls_endpoint_retry "${_W_PORT}" "${_W_HOST}"; then
+          clear_runtime_cert_backup || true
+          FRONTEND_TLS_STATE="active"
+          FRONTEND_TLS_ACTIVE=1
+          EXPECT_PGBOUNCER=1
+          write_state_file || true
+          render_ui || true
+          if ! commit_applied_fingerprint "${_W_SRC_CERT}" "${_W_SRC_KEY}"; then
+            echo "TLS setup: failed to record applied certificate for ${PUBLIC_HOST_SANITIZED}; will retry." >&2
+            continue
+          fi
+          _w_state="active"
+        else
+          # SIGHUP delivered but B not observed: live state is UNKNOWN.
+          # Do not assume rejection. Restore A files, reload them, and
+          # confirm A is actually served again before claiming active.
+          echo "TLS renewal endpoint verification failed; restoring previous certificate" >&2
+          if restore_runtime_cert_backup && rollback_renewal_to_previous "${_W_PORT}" "${_W_HOST}"; then
+            echo "Previous TLS certificate verified after rollback" >&2
+            clear_runtime_cert_backup || true
+          else
+            echo "Previous TLS certificate could not be verified after rollback; stopping container to avoid false state" >&2
+            abort_container_after_unverified_rollback
+          fi
         fi
-        _w_state="active"
       else
-        # Rejected reload (or failed endpoint): the running PgBouncer kept
-        # its previous in-memory TLS context, so restoring the previous
-        # files on disk reunites filesystem and process state with no
-        # further reload required.
-        echo "TLS setup: renewed certificate not served by PgBouncer for ${PUBLIC_HOST_SANITIZED}; restoring previous certificate and retrying later." >&2
+        # No delivery confirmed: the process is presumed still on A.
+        # Reunite the disk with that state and confirm best-effort; a
+        # failed confirmation only warns here because no reload was
+        # delivered and liveness remains the supervisor's domain.
+        echo "TLS renewal reload not delivered; restoring previous certificate files" >&2
         restore_runtime_cert_backup || true
-        clear_runtime_cert_backup || true
+        if rollback_renewal_to_previous "${_W_PORT}" "${_W_HOST}"; then
+          clear_runtime_cert_backup || true
+        else
+          echo "TLS renewal rollback after undelivered reload could not be confirmed; keeping backup and retrying later." >&2
+        fi
       fi
       continue
     fi
@@ -1298,29 +1422,47 @@ cert_watcher() {
       # Dynamic prefer transition: plaintext -> require without restart.
       # The on-disk config may already carry require from a previous
       # failed attempt while the running process still serves plaintext;
-      # state stays plaintext until the endpoint is verified. On failure
-      # the config is realigned back to disable (what is actually
-      # running) so disk and process agree.
+      # state stays plaintext until the endpoint is verified.
       echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; applying frontend TLS" >&2
       if install_runtime_cert "${_W_SRC_CERT}" "${_W_SRC_KEY}" && \
          update_config_tls_to_require && \
-         verify_automatic_tls_config "${PG_CONFIG_FILE}" "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null && \
-         reload_pgbouncer && sleep 2 2>/dev/null && \
-         verify_frontend_tls_endpoint "${_W_PORT}" "${_W_HOST}"; then
-        echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; frontend TLS is now required" >&2
-        FRONTEND_TLS_ACTIVE=1
-        FRONTEND_TLS_STATE="active"
-        EXPECT_PGBOUNCER=1
-        write_state_file || true
-        render_ui || true
-        print_config_redacted >/dev/null 2>&1 || true
-        if ! commit_applied_fingerprint "${_W_SRC_CERT}" "${_W_SRC_KEY}"; then
-          echo "TLS setup: failed to record applied certificate for ${PUBLIC_HOST_SANITIZED}; will retry." >&2
-          continue
+         verify_automatic_tls_config "${PG_CONFIG_FILE}" "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null; then
+        if reload_pgbouncer; then
+          echo "Frontend TLS reload delivered; verifying live endpoint" >&2
+          if verify_frontend_tls_endpoint_retry "${_W_PORT}" "${_W_HOST}"; then
+            echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; frontend TLS is now required" >&2
+            FRONTEND_TLS_ACTIVE=1
+            FRONTEND_TLS_STATE="active"
+            EXPECT_PGBOUNCER=1
+            write_state_file || true
+            render_ui || true
+            print_config_redacted >/dev/null 2>&1 || true
+            if ! commit_applied_fingerprint "${_W_SRC_CERT}" "${_W_SRC_KEY}"; then
+              echo "TLS setup: failed to record applied certificate for ${PUBLIC_HOST_SANITIZED}; will retry." >&2
+              continue
+            fi
+            _w_state="active"
+          else
+            # SIGHUP delivered but the expected certificate is not
+            # observed: live state is UNKNOWN, so do not assume the old
+            # plaintext survived. Roll back explicitly and confirm it.
+            echo "Frontend TLS endpoint verification failed after reload; rolling back to plaintext" >&2
+            if rollback_prefer_to_plaintext "${_W_PORT}" "${_W_HOST}"; then
+              echo "Frontend TLS rollback to plaintext verified" >&2
+            else
+              echo "Frontend TLS rollback could not be verified; stopping container to avoid false state" >&2
+              abort_container_after_unverified_rollback
+            fi
+          fi
+        else
+          # Case A: no delivery confirmed, so the running process is
+          # presumed still plaintext. Realign the config best-effort
+          # (no second reload) and retry later.
+          echo "TLS setup: frontend TLS reload not delivered; staying on plaintext and retrying later." >&2
+          downgrade_config_tls_to_disable || true
         fi
-        _w_state="active"
       else
-        echo "TLS setup: failed to apply frontend TLS for ${PUBLIC_HOST_SANITIZED}; staying on plaintext and retrying later." >&2
+        echo "TLS setup: failed to prepare frontend TLS for ${PUBLIC_HOST_SANITIZED}; staying on plaintext and retrying later." >&2
         downgrade_config_tls_to_disable || true
       fi
       continue
@@ -1424,7 +1566,7 @@ supervise_waiting() {
                 EXPECT_PGBOUNCER=1
                 start_pgbouncer "$@"
                 if wait_pgbouncer_tcp 15 && \
-                   verify_frontend_tls_endpoint "${LISTEN_PORT:-5432}" "${PUBLIC_HOST_SANITIZED:-localhost}" && \
+                   verify_frontend_tls_endpoint_retry "${LISTEN_PORT:-5432}" "${PUBLIC_HOST_SANITIZED:-localhost}" && \
                    publish_tls_active "${_sw_cert}" "${_sw_key}"; then
                   echo "PgBouncer started with frontend TLS verified active." >&2
                 else
@@ -1491,7 +1633,7 @@ if [ "${EXPECT_PGBOUNCER}" = "1" ]; then
     # verified before `active` may be published (same rule as late
     # activation). Applied is committed only on success.
     if wait_pgbouncer_tcp 15 && \
-       verify_frontend_tls_endpoint "${LISTEN_PORT:-5432}" "${PUBLIC_HOST_SANITIZED:-localhost}" && \
+       verify_frontend_tls_endpoint_retry "${LISTEN_PORT:-5432}" "${PUBLIC_HOST_SANITIZED:-localhost}" && \
        publish_tls_active "${_BOOT_TLS_CERT}" "${_BOOT_TLS_KEY}"; then
       echo "Frontend TLS verified active for ${PUBLIC_HOST_SANITIZED}." >&2
     else

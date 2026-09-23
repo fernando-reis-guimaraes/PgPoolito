@@ -1618,7 +1618,8 @@ docker rm -f "pgpooler-manual-tls-${SUFFIX}" >/dev/null 2>&1 || true
 # secrets) that the test harness creates/removes inside a running
 # container; production behavior is unchanged when they are absent:
 #   /run/pgbouncer/.fail-tls-config-update -> config rewrite fails
-#   /run/pgbouncer/.fail-tls-reload        -> SIGHUP/reload fails
+#   /run/pgbouncer/.fail-tls-reload        -> forward SIGHUP never sent
+#   /run/pgbouncer/.fail-tls-rollback      -> rollback SIGHUP never sent
 #   /run/pgbouncer/.fail-tls-backup        -> renewal backup fails
 #   /run/pgbouncer/.fail-tls-endpoint-verification -> endpoint probe fails
 #   /run/pgbouncer/.fail-tls-protocols     -> rewritten config carries a
@@ -2241,8 +2242,19 @@ _G2_PID_BEFORE=$(docker exec "pgpooler-g2-prefer-${SUFFIX}" cat /run/pgbouncer/p
 # Inject a TLS setting PgBouncer rejects at RELOAD while staying alive.
 docker exec "pgpooler-g2-prefer-${SUFFIX}" touch /run/pgbouncer/.fail-tls-protocols 2>/dev/null || true
 install_test_cert "${TLS_G2_DIR}" "${TLS_G2_TREE}" "localhost" || true
-sleep 13
-if docker logs "pgpooler-g2-prefer-${SUFFIX}" 2>&1 | grep -q "got SIGHUP"; then
+# Poll: key generation plus a full rejected attempt can exceed fixed sleeps
+# under load; the first delivered SIGHUP proves the attempt ran.
+_G2_SIGHUP_SEEN=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  if docker logs "pgpooler-g2-prefer-${SUFFIX}" 2>&1 | grep -q "got SIGHUP"; then
+    _G2_SIGHUP_SEEN=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_G2_SIGHUP_SEEN}" = "1" ]; then
   pass "G2: SIGHUP was actually delivered"
 else
   fail "G2: SIGHUP delivery not observed in logs"
@@ -2296,8 +2308,9 @@ else
   fail "G2: plaintext should still work after rejected reload"
 fi
 # Heal: removing the flag rewrites a clean config; the retry verifies live.
+# A generous window covers a fault-phase iteration still in flight.
 docker exec "pgpooler-g2-prefer-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-protocols 2>/dev/null || true
-if wait_tls_state "pgpooler-g2-prefer-${SUFFIX}" "active" 30; then
+if wait_tls_state "pgpooler-g2-prefer-${SUFFIX}" "active" 60; then
   pass "G2: retry succeeds after fault removed"
 else
   fail "G2: retry did not reach active"
@@ -2365,8 +2378,19 @@ else
   fail "G3 cert B generation failed"
 fi
 install_test_cert "${TLS_G3B_DIR}" "${TLS_G3_TREE}" "localhost" || true
-sleep 13
-if docker logs "pgpooler-g3-renew-${SUFFIX}" 2>&1 | grep -q "got SIGHUP"; then
+# Poll: key generation plus a full rejected attempt can exceed fixed
+# sleeps under load; the first delivered SIGHUP proves the attempt ran.
+_G3_SIGHUP_SEEN=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  if docker logs "pgpooler-g3-renew-${SUFFIX}" 2>&1 | grep -q "got SIGHUP"; then
+    _G3_SIGHUP_SEEN=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_G3_SIGHUP_SEEN}" = "1" ]; then
   pass "G3: SIGHUP was actually delivered for B"
 else
   fail "G3: SIGHUP delivery not observed in logs"
@@ -2377,25 +2401,29 @@ if [ -n "${_G3_PID_BEFORE}" ] && [ "${_G3_PID_BEFORE}" = "${_G3_PID_AFTER}" ]; t
 else
   fail "G3: process must stay alive across rejected renewal"
 fi
-_G3_FP_STILL=$(tls_fingerprint "${G3_PORT}" "localhost")
-if [ -n "${_G3_FP_STILL}" ] && [ "${_G3_FP_STILL}" = "${_G3_FP_A}" ]; then
+# Fault cycling alternates bad-B files with restored-A files; wait for a
+# fully consistent restored snapshot instead of asserting single reads.
+_G3_STEADY=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  _s=$(tls_fingerprint "${G3_PORT}" "localhost")
+  _f=$(runtime_file_hash_now "pgpooler-g3-renew-${SUFFIX}")
+  _a=$(read_applied_fp "pgpooler-g3-renew-${SUFFIX}")
+  if [ -n "${_s}" ] && [ "${_s}" = "${_G3_FP_A}" ] && [ "${_f}" = "${_G3_RT_FILE_A}" ] && [ "${_a}" = "${_G3_APPLIED_A}" ]; then
+    _G3_STEADY=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_G3_STEADY}" = "1" ]; then
   pass "G3: rejected renewal keeps serving A"
-else
-  fail "G3: endpoint must still serve A after rejected reload"
-fi
-_G3_APPLIED_STILL=$(read_applied_fp "pgpooler-g3-renew-${SUFFIX}")
-if [ "${_G3_APPLIED_STILL}" = "${_G3_APPLIED_A}" ]; then
+  pass "G3: runtime files restored to A consistently"
   pass "G3: applied remains A after rejected reload"
 else
+  fail "G3: endpoint must still serve A after rejected reload"
+  fail "G3: runtime files should be restored to A"
   fail "G3: applied must remain A after rejected reload"
-fi
-_G3_RT_NOW=$(runtime_file_hash_now "pgpooler-g3-renew-${SUFFIX}")
-# The failure path restores the A backup and then cleans the backup
-# files, so compare against the pre-B reference hash captured above.
-if [ -n "${_G3_RT_NOW}" ] && [ -n "${_G3_RT_FILE_A}" ] && [ "${_G3_RT_NOW}" = "${_G3_RT_FILE_A}" ]; then
-  pass "G3: runtime files restored to A consistently"
-else
-  fail "G3: runtime files should be restored to A (got '${_G3_RT_NOW}')"
 fi
 if assert_state_now "pgpooler-g3-renew-${SUFFIX}" "active"; then
   pass "G3: state remains active after rejected reload"
@@ -2731,6 +2759,23 @@ else
   fi
 fi
 
+# Wait until a container stops (fail-closed termination asserts).
+wait_container_stopped() {
+  _wcs_c="$1"; _wcs_timeout="${2:-60}"; _wcs_t=0
+  while [ "${_wcs_t}" -lt "${_wcs_timeout}" ]; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "${_wcs_c}" 2>/dev/null || printf 'false')" = "false" ]; then
+      return 0
+    fi
+    sleep 1
+    _wcs_t=$((_wcs_t + 1))
+  done
+  return 1
+}
+# Count PgBouncer SIGHUP deliveries observed in container logs.
+sighup_count() {
+  docker logs "$1" 2>&1 | grep -c "got SIGHUP" || true
+}
+
 log "--- Test G7: renewal backup failure aborts before touching active pair ---"
 TLS_G7A_DIR="${TLS_BASE}/g7a"
 TLS_G7B_DIR="${TLS_BASE}/g7b"
@@ -2830,6 +2875,596 @@ else
   fail "G7: applied should equal source B after success"
 fi
 docker rm -f "pgpooler-g7-renew-${SUFFIX}" >/dev/null 2>&1 || true
+
+# ================================================== Ambiguous reload (H)
+# SIGHUP-delivered-but-unverified handling. Forward reload and rollback
+# reload use separate fault flags so each half is independently
+# deterministic:
+#   .fail-tls-reload   -> forward SIGHUP never sent (old state authoritative)
+#   .fail-tls-rollback -> rollback SIGHUP never sent (rollback unconfirmable)
+#   endpoint-verification fault -> probes report failure while real
+#     reloads still apply (the ambiguous case under test)
+
+log "--- Test H1: prefer reload succeeds, probe falsely fails, rollback confirmed ---"
+TLS_H1_DIR="${TLS_BASE}/h1"
+TLS_H1_TREE="${TLS_BASE}/h1-tree"
+H1_PORT=16457
+H1_UI=18057
+mkdir -p "${TLS_H1_TREE}/live/localhost" 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_H1_DIR}"; then
+  pass "H1 cert generated (not yet installed)"
+else
+  fail "H1 cert generation failed"
+fi
+docker run -d --name "pgpooler-h1-prefer-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${H1_PORT}:6432" -p "127.0.0.1:${H1_UI}:8080" \
+  -v "${TLS_H1_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer "${H1_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "H1: initial plaintext works"
+else
+  fail "H1: initial plaintext did not start"
+fi
+_H1_PID_BEFORE=$(docker exec "pgpooler-h1-prefer-${SUFFIX}" cat /run/pgbouncer/pgbouncer.pid 2>/dev/null || printf '')
+# Fault only the observer: the real SIGHUP still applies require, while
+# every endpoint probe reports failure (the ambiguous case).
+docker exec "pgpooler-h1-prefer-${SUFFIX}" touch /run/pgbouncer/.fail-tls-endpoint-verification 2>/dev/null || true
+install_test_cert "${TLS_H1_DIR}" "${TLS_H1_TREE}" "localhost" || true
+# Under a persistent probe fault the service cycles require-live (while
+# probes retry) back to verified plaintext (after rollback), so every
+# phase-dependent assertion polls for a steady observation.
+_H1_SIGHUPS=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  _H1_SIGHUPS=$(sighup_count "pgpooler-h1-prefer-${SUFFIX}")
+  if [ "${_H1_SIGHUPS}" -ge 2 ]; then
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H1_SIGHUPS}" -ge 2 ]; then
+  pass "H1: rollback reload explicitly sent (SIGHUPs=${_H1_SIGHUPS})"
+else
+  fail "H1: expected forward plus rollback SIGHUPs (got ${_H1_SIGHUPS})"
+fi
+_H1_EMPTY=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  if [ -z "$(tls_fingerprint "${H1_PORT}" "localhost")" ]; then
+    _H1_EMPTY=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H1_EMPTY}" = "1" ]; then
+  pass "H1: candidate TLS state not left running"
+else
+  fail "H1: endpoint must not serve the candidate after rollback"
+fi
+if assert_state_now "pgpooler-h1-prefer-${SUFFIX}" "plaintext"; then
+  pass "H1: state stays plaintext until rollback confirmed"
+else
+  fail "H1: state must remain plaintext"
+fi
+if fetch_ui "${H1_UI}" "/tmp/pgpooler-h1-ui-${SUFFIX}.html"; then
+  if grep -q "Available and required" "/tmp/pgpooler-h1-ui-${SUFFIX}.html" 2>/dev/null; then
+    fail "H1: UI must not claim active"
+  else
+    pass "H1: UI does not claim active"
+  fi
+  rm -f "/tmp/pgpooler-h1-ui-${SUFFIX}.html" 2>/dev/null || true
+else
+  fail "H1: UI fetch failed"
+fi
+_H1_APPLIED=$(read_applied_fp "pgpooler-h1-prefer-${SUFFIX}")
+if [ -z "${_H1_APPLIED}" ]; then
+  pass "H1: applied fingerprint not advanced on ambiguity"
+else
+  fail "H1: applied must not advance without verification"
+fi
+_H1_RB_LOGGED=0
+_i=0
+while [ "${_i}" -lt 15 ]; do
+  if docker logs "pgpooler-h1-prefer-${SUFFIX}" 2>&1 | grep -q "Frontend TLS rollback to plaintext verified"; then
+    _H1_RB_LOGGED=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H1_RB_LOGGED}" = "1" ]; then
+  pass "H1: rollback confirmation logged"
+else
+  fail "H1: rollback confirmation should be logged"
+fi
+# Plaintext must REALLY work after rollback: poll for a live session
+# because fault cycling alternates require-live and plaintext phases.
+_H1_PLAIN_OK=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  if try_connect "${H1_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+    _H1_PLAIN_OK=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H1_PLAIN_OK}" = "1" ]; then
+  pass "H1: plaintext really works after confirmed rollback"
+else
+  fail "H1: plaintext must work after confirmed rollback"
+fi
+_H1_PID_AFTER=$(docker exec "pgpooler-h1-prefer-${SUFFIX}" cat /run/pgbouncer/pgbouncer.pid 2>/dev/null || printf '')
+if [ -n "${_H1_PID_BEFORE}" ] && [ "${_H1_PID_BEFORE}" = "${_H1_PID_AFTER}" ]; then
+  pass "H1: container did not restart across rollback"
+else
+  fail "H1: container must not restart on confirmed rollback"
+fi
+# Heal: the watcher retries the candidate and verifies it live.
+docker exec "pgpooler-h1-prefer-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-endpoint-verification 2>/dev/null || true
+if wait_tls_state "pgpooler-h1-prefer-${SUFFIX}" "active" 40; then
+  pass "H1: retry succeeds after fault removed"
+else
+  fail "H1: retry did not reach active"
+fi
+sleep 2
+_H1_SERVED_AFTER=$(tls_fingerprint "${H1_PORT}" "localhost")
+_H1_EXPECTED_AFTER=$(runtime_leaf_fp_now "pgpooler-h1-prefer-${SUFFIX}")
+if [ -n "${_H1_SERVED_AFTER}" ] && [ "${_H1_SERVED_AFTER}" = "${_H1_EXPECTED_AFTER}" ]; then
+  pass "H1: endpoint serves expected certificate after heal"
+else
+  fail "H1: served certificate must match after heal"
+fi
+if tls_disable_connect "${H1_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  fail "H1: plaintext must be rejected after heal"
+else
+  pass "H1: plaintext rejected after heal"
+fi
+if tls_require_connect "${H1_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "H1: TLS works after heal"
+else
+  fail "H1: TLS should work after heal"
+fi
+docker rm -f "pgpooler-h1-prefer-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test H2: renewal B applies, probe falsely fails, rollback A confirmed ---"
+TLS_H2A_DIR="${TLS_BASE}/h2a"
+TLS_H2B_DIR="${TLS_BASE}/h2b"
+TLS_H2_TREE="${TLS_BASE}/h2-tree"
+H2_PORT=16458
+H2_UI=18058
+if make_test_cert "localhost" "${TLS_H2A_DIR}" && install_test_cert "${TLS_H2A_DIR}" "${TLS_H2_TREE}" "localhost"; then
+  pass "H2 cert A installed"
+else
+  fail "H2 cert A setup failed"
+fi
+docker run -d --name "pgpooler-h2-renew-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${H2_PORT}:6432" -p "127.0.0.1:${H2_UI}:8080" \
+  -v "${TLS_H2_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_tls_state "pgpooler-h2-renew-${SUFFIX}" "active" 30; then
+  pass "H2: boot reaches verified active (cert A)"
+else
+  fail "H2: boot did not reach active"
+fi
+_H2_FP_A=$(tls_fingerprint "${H2_PORT}" "localhost")
+_H2_APPLIED_A=$(read_applied_fp "pgpooler-h2-renew-${SUFFIX}")
+_H2_RT_FILE_A=$(runtime_file_hash_now "pgpooler-h2-renew-${SUFFIX}")
+if [ -n "${_H2_FP_A}" ] && [ -n "${_H2_APPLIED_A}" ] && [ -n "${_H2_RT_FILE_A}" ]; then
+  pass "H2: cert A verified live with recorded state"
+else
+  fail "H2: cert A should be live with recorded state"
+fi
+_H2_PID_BEFORE=$(docker exec "pgpooler-h2-renew-${SUFFIX}" cat /run/pgbouncer/pgbouncer.pid 2>/dev/null || printf '')
+docker exec "pgpooler-h2-renew-${SUFFIX}" touch /run/pgbouncer/.fail-tls-endpoint-verification 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_H2B_DIR}"; then
+  pass "H2 cert B generated"
+else
+  fail "H2 cert B generation failed"
+fi
+install_test_cert "${TLS_H2B_DIR}" "${TLS_H2_TREE}" "localhost" || true
+# Fault cycling alternates B-live and restored-A phases; wait for a
+# fully consistent restored snapshot instead of asserting single reads.
+_H2_SIGHUPS=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  _H2_SIGHUPS=$(sighup_count "pgpooler-h2-renew-${SUFFIX}")
+  if [ "${_H2_SIGHUPS}" -ge 2 ]; then
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H2_SIGHUPS}" -ge 2 ]; then
+  pass "H2: rollback reload explicitly sent (SIGHUPs=${_H2_SIGHUPS})"
+else
+  fail "H2: expected forward plus rollback SIGHUPs (got ${_H2_SIGHUPS})"
+fi
+_H2_STEADY=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  _s=$(tls_fingerprint "${H2_PORT}" "localhost")
+  _f=$(runtime_file_hash_now "pgpooler-h2-renew-${SUFFIX}")
+  _a=$(read_applied_fp "pgpooler-h2-renew-${SUFFIX}")
+  _st=$(read_tls_state_now "pgpooler-h2-renew-${SUFFIX}")
+  if [ -n "${_s}" ] && [ "${_s}" = "${_H2_FP_A}" ] && [ "${_f}" = "${_H2_RT_FILE_A}" ] && [ "${_a}" = "${_H2_APPLIED_A}" ] && [ "${_st}" = "active" ]; then
+    _H2_STEADY=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H2_STEADY}" = "1" ]; then
+  pass "H2: endpoint serves A again after confirmed rollback"
+  pass "H2: runtime files are A after rollback"
+  pass "H2: applied remains A after rollback"
+  pass "H2: state remains active after confirmed rollback"
+else
+  fail "H2: endpoint must serve A after confirmed rollback"
+  fail "H2: runtime files must be A after rollback"
+  fail "H2: applied must remain A after rollback"
+  fail "H2: state must remain active after confirmed rollback"
+fi
+_H2_RB_LOGGED=0
+_i=0
+while [ "${_i}" -lt 15 ]; do
+  if docker logs "pgpooler-h2-renew-${SUFFIX}" 2>&1 | grep -q "Previous TLS certificate verified after rollback"; then
+    _H2_RB_LOGGED=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H2_RB_LOGGED}" = "1" ]; then
+  pass "H2: rollback confirmation logged"
+else
+  fail "H2: rollback confirmation should be logged"
+fi
+if tls_require_connect "${H2_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "H2: TLS still works after confirmed rollback"
+else
+  fail "H2: TLS should still work after confirmed rollback"
+fi
+_H2_PID_AFTER=$(docker exec "pgpooler-h2-renew-${SUFFIX}" cat /run/pgbouncer/pgbouncer.pid 2>/dev/null || printf '')
+if [ -n "${_H2_PID_BEFORE}" ] && [ "${_H2_PID_BEFORE}" = "${_H2_PID_AFTER}" ]; then
+  pass "H2: same process survived rollback"
+else
+  fail "H2: process must stay alive across confirmed rollback"
+fi
+docker exec "pgpooler-h2-renew-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-endpoint-verification 2>/dev/null || true
+_H2_FP_B=""
+_tries=0
+while [ "${_tries}" -lt 30 ]; do
+  sleep 1
+  _H2_FP_B=$(tls_fingerprint "${H2_PORT}" "localhost")
+  if [ -n "${_H2_FP_B}" ] && [ "${_H2_FP_B}" != "${_H2_FP_A}" ]; then
+    break
+  fi
+  _tries=$((_tries + 1))
+done
+if [ -n "${_H2_FP_B}" ] && [ "${_H2_FP_B}" != "${_H2_FP_A}" ]; then
+  pass "H2: retry serves renewed cert B"
+else
+  fail "H2: retry did not serve cert B"
+fi
+_H2_SRC_B=$(src_fp_in_container "pgpooler-h2-renew-${SUFFIX}" "localhost")
+_H2_APPLIED_B=""
+_tries=0
+while [ "${_tries}" -lt 15 ]; do
+  _H2_APPLIED_B=$(read_applied_fp "pgpooler-h2-renew-${SUFFIX}")
+  if [ -n "${_H2_SRC_B}" ] && [ "${_H2_SRC_B}" = "${_H2_APPLIED_B}" ]; then
+    break
+  fi
+  sleep 1
+  _tries=$((_tries + 1))
+done
+if [ -n "${_H2_SRC_B}" ] && [ "${_H2_SRC_B}" = "${_H2_APPLIED_B}" ]; then
+  pass "H2: applied becomes B only after endpoint serves B"
+else
+  fail "H2: applied should equal source B after success"
+fi
+docker rm -f "pgpooler-h2-renew-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test H3: unverifiable rollback stops the container, never lies ---"
+# Prefer variant: endpoint fault plus rollback reload fault. The forward
+# reload really applies require, the probe falsely fails, and the
+# rollback reload cannot be delivered, so plaintext can never be
+# confirmed and the container must stop instead of claiming it.
+TLS_H3P_DIR="${TLS_BASE}/h3p"
+TLS_H3P_TREE="${TLS_BASE}/h3p-tree"
+H3P_PORT=16459
+H3P_UI=18059
+mkdir -p "${TLS_H3P_TREE}/live/localhost" 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_H3P_DIR}"; then
+  pass "H3p cert generated (not yet installed)"
+else
+  fail "H3p cert generation failed"
+fi
+docker run -d --name "pgpooler-h3-prefer-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${H3P_PORT}:6432" -p "127.0.0.1:${H3P_UI}:8080" \
+  -v "${TLS_H3P_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer "${H3P_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "H3p: initial plaintext works"
+else
+  fail "H3p: initial plaintext did not start"
+fi
+docker exec "pgpooler-h3-prefer-${SUFFIX}" touch /run/pgbouncer/.fail-tls-endpoint-verification /run/pgbouncer/.fail-tls-rollback 2>/dev/null || true
+install_test_cert "${TLS_H3P_DIR}" "${TLS_H3P_TREE}" "localhost" || true
+_H3P_SAW_ACTIVE=0
+_i=0
+while [ "${_i}" -lt 45 ]; do
+  if [ "$(docker inspect -f '{{.State.Running}}' "pgpooler-h3-prefer-${SUFFIX}" 2>/dev/null || printf 'false')" = "false" ]; then
+    break
+  fi
+  _st=$(read_tls_state_now "pgpooler-h3-prefer-${SUFFIX}")
+  if [ "${_st}" = "active" ]; then
+    _H3P_SAW_ACTIVE=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H3P_SAW_ACTIVE}" = "0" ]; then
+  pass "H3p: active never published on unverifiable rollback"
+else
+  fail "H3p: active must never appear without verification"
+fi
+if wait_container_stopped "pgpooler-h3-prefer-${SUFFIX}" 60; then
+  pass "H3p: container stopped instead of false plaintext"
+else
+  fail "H3p: container should stop when rollback is unconfirmable"
+fi
+if docker logs "pgpooler-h3-prefer-${SUFFIX}" 2>&1 | grep -q "got SIGHUP"; then
+  pass "H3p: forward SIGHUP was delivered before rollback failure"
+else
+  fail "H3p: forward SIGHUP delivery not observed"
+fi
+if docker logs "pgpooler-h3-prefer-${SUFFIX}" 2>&1 | grep -q "rollback could not be verified; stopping container"; then
+  pass "H3p: unverifiable rollback logged"
+else
+  fail "H3p: unverifiable rollback should be logged"
+fi
+docker cp "pgpooler-h3-prefer-${SUFFIX}:/run/pgbouncer/pgpooler.state" "/tmp/pgpooler-h3p-state-${SUFFIX}" 2>/dev/null || true
+if grep -q "^TLS_STATE=plaintext" "/tmp/pgpooler-h3p-state-${SUFFIX}" 2>/dev/null; then
+  pass "H3p: last published state was truthful plaintext"
+else
+  fail "H3p: last state must not claim active"
+fi
+if docker cp "pgpooler-h3-prefer-${SUFFIX}:/run/pgbouncer/tls/.fingerprint" "/tmp/pgpooler-h3p-fp-${SUFFIX}" 2>/dev/null; then
+  if [ -s "/tmp/pgpooler-h3p-fp-${SUFFIX}" ]; then
+    fail "H3p: applied fingerprint must stay empty"
+  else
+    pass "H3p: applied fingerprint empty"
+  fi
+else
+  pass "H3p: applied fingerprint empty"
+fi
+docker cp "pgpooler-h3-prefer-${SUFFIX}:/var/www/index.html" "/tmp/pgpooler-h3p-ui-${SUFFIX}.html" 2>/dev/null || true
+if grep -q "Available and required" "/tmp/pgpooler-h3p-ui-${SUFFIX}.html" 2>/dev/null; then
+  fail "H3p: UI must never claim active"
+else
+  pass "H3p: UI never claimed active"
+fi
+rm -f "/tmp/pgpooler-h3p-state-${SUFFIX}" "/tmp/pgpooler-h3p-fp-${SUFFIX}" "/tmp/pgpooler-h3p-ui-${SUFFIX}.html" 2>/dev/null || true
+if [ "$(docker inspect -f '{{.State.Running}}' "pgpooler-h3-prefer-${SUFFIX}" 2>/dev/null || printf 'false')" = "false" ]; then
+  pass "H3p: container stays stopped (no restart loop from test)"
+else
+  fail "H3p: container should remain stopped"
+fi
+docker rm -f "pgpooler-h3-prefer-${SUFFIX}" >/dev/null 2>&1 || true
+# Renewal variant: B really applies, probe falsely fails, rollback
+# reload fails, so A cannot be re-confirmed and the container stops
+# with applied still A and the backup retained.
+TLS_H3RA_DIR="${TLS_BASE}/h3ra"
+TLS_H3RB_DIR="${TLS_BASE}/h3rb"
+TLS_H3R_TREE="${TLS_BASE}/h3r-tree"
+H3R_PORT=16460
+H3R_UI=18060
+if make_test_cert "localhost" "${TLS_H3RA_DIR}" && install_test_cert "${TLS_H3RA_DIR}" "${TLS_H3R_TREE}" "localhost"; then
+  pass "H3r cert A installed"
+else
+  fail "H3r cert A setup failed"
+fi
+docker run -d --name "pgpooler-h3-renew-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${H3R_PORT}:6432" -p "127.0.0.1:${H3R_UI}:8080" \
+  -v "${TLS_H3R_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_tls_state "pgpooler-h3-renew-${SUFFIX}" "active" 30; then
+  pass "H3r: boot reaches verified active (cert A)"
+else
+  fail "H3r: boot did not reach active"
+fi
+_H3R_APPLIED_A=$(read_applied_fp "pgpooler-h3-renew-${SUFFIX}")
+if [ -n "${_H3R_APPLIED_A}" ]; then
+  pass "H3r: applied A recorded"
+else
+  fail "H3r: applied A should be recorded"
+fi
+docker exec "pgpooler-h3-renew-${SUFFIX}" touch /run/pgbouncer/.fail-tls-endpoint-verification /run/pgbouncer/.fail-tls-rollback 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_H3RB_DIR}"; then
+  pass "H3r cert B generated"
+else
+  fail "H3r cert B generation failed"
+fi
+install_test_cert "${TLS_H3RB_DIR}" "${TLS_H3R_TREE}" "localhost" || true
+if wait_container_stopped "pgpooler-h3-renew-${SUFFIX}" 90; then
+  pass "H3r: container stopped instead of false active=A"
+else
+  fail "H3r: container should stop when rollback is unconfirmable"
+fi
+if docker logs "pgpooler-h3-renew-${SUFFIX}" 2>&1 | grep -q "got SIGHUP"; then
+  pass "H3r: forward SIGHUP was delivered before rollback failure"
+else
+  fail "H3r: forward SIGHUP delivery not observed"
+fi
+if docker logs "pgpooler-h3-renew-${SUFFIX}" 2>&1 | grep -q "could not be verified after rollback; stopping container"; then
+  pass "H3r: unverifiable rollback logged"
+else
+  fail "H3r: unverifiable rollback should be logged"
+fi
+docker cp "pgpooler-h3-renew-${SUFFIX}:/run/pgbouncer/tls/.fingerprint" "/tmp/pgpooler-h3r-fp-${SUFFIX}" 2>/dev/null || true
+if [ -f "/tmp/pgpooler-h3r-fp-${SUFFIX}" ] && [ "$(tr -d '\n' < "/tmp/pgpooler-h3r-fp-${SUFFIX}" 2>/dev/null)" = "${_H3R_APPLIED_A}" ]; then
+  pass "H3r: applied still A (never advanced to B)"
+else
+  fail "H3r: applied must remain A"
+fi
+if docker cp "pgpooler-h3-renew-${SUFFIX}:/run/pgbouncer/tls/.fullchain.pem.prev" "/tmp/pgpooler-h3r-prev-${SUFFIX}" 2>/dev/null; then
+  pass "H3r: backup retained for recovery"
+else
+  fail "H3r: backup must be retained when rollback is unconfirmed"
+fi
+if PGPASSWORD="${FRONTEND_PASSWORD}" psql -X -q -h 127.0.0.1 -p "${H3R_PORT}" -U "${FRONTEND_USER}" -d "${TESTDB}" -tA -c "SELECT 1;" >/dev/null 2>&1; then
+  fail "H3r: no service may be offered after stop"
+else
+  pass "H3r: no false service after stop"
+fi
+if [ "$(docker inspect -f '{{.State.Running}}' "pgpooler-h3-renew-${SUFFIX}" 2>/dev/null || printf 'false')" = "false" ]; then
+  pass "H3r: container stays stopped"
+else
+  fail "H3r: container should remain stopped"
+fi
+rm -f "/tmp/pgpooler-h3r-fp-${SUFFIX}" "/tmp/pgpooler-h3r-prev-${SUFFIX}" 2>/dev/null || true
+docker rm -f "pgpooler-h3-renew-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test H4: reload failure versus probe failure behave differently ---"
+TLS_H4A_DIR="${TLS_BASE}/h4a"
+TLS_H4A_TREE="${TLS_BASE}/h4a-tree"
+H4A_PORT=16455
+H4A_UI=18055
+mkdir -p "${TLS_H4A_TREE}/live/localhost" 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_H4A_DIR}"; then
+  pass "H4a cert generated (not yet installed)"
+else
+  fail "H4a cert generation failed"
+fi
+docker run -d --name "pgpooler-h4-reloadfail-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${H4A_PORT}:6432" -p "127.0.0.1:${H4A_UI}:8080" \
+  -v "${TLS_H4A_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer "${H4A_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "H4a: initial plaintext works"
+else
+  fail "H4a: initial plaintext did not start"
+fi
+docker exec "pgpooler-h4-reloadfail-${SUFFIX}" touch /run/pgbouncer/.fail-tls-reload 2>/dev/null || true
+install_test_cert "${TLS_H4A_DIR}" "${TLS_H4A_TREE}" "localhost" || true
+sleep 13
+if [ "$(sighup_count "pgpooler-h4-reloadfail-${SUFFIX}")" = "0" ]; then
+  pass "H4a: no SIGHUP sent when reload helper fails"
+else
+  fail "H4a: reload failure must send no SIGHUP"
+fi
+if assert_state_now "pgpooler-h4-reloadfail-${SUFFIX}" "plaintext"; then
+  pass "H4a: state stays plaintext"
+else
+  fail "H4a: state must remain plaintext"
+fi
+if [ -z "$(read_applied_fp "pgpooler-h4-reloadfail-${SUFFIX}")" ]; then
+  pass "H4a: applied stays empty"
+else
+  fail "H4a: applied must stay empty"
+fi
+docker rm -f "pgpooler-h4-reloadfail-${SUFFIX}" >/dev/null 2>&1 || true
+TLS_H4B_DIR="${TLS_BASE}/h4b"
+TLS_H4B_TREE="${TLS_BASE}/h4b-tree"
+H4B_PORT=16456
+H4B_UI=18056
+mkdir -p "${TLS_H4B_TREE}/live/localhost" 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_H4B_DIR}"; then
+  pass "H4b cert generated (not yet installed)"
+else
+  fail "H4b cert generation failed"
+fi
+docker run -d --name "pgpooler-h4-probefail-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${H4B_PORT}:6432" -p "127.0.0.1:${H4B_UI}:8080" \
+  -v "${TLS_H4B_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer "${H4B_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "H4b: initial plaintext works"
+else
+  fail "H4b: initial plaintext did not start"
+fi
+docker exec "pgpooler-h4-probefail-${SUFFIX}" touch /run/pgbouncer/.fail-tls-endpoint-verification 2>/dev/null || true
+install_test_cert "${TLS_H4B_DIR}" "${TLS_H4B_TREE}" "localhost" || true
+_H4B_SIGHUPS=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  _H4B_SIGHUPS=$(sighup_count "pgpooler-h4-probefail-${SUFFIX}")
+  if [ "${_H4B_SIGHUPS}" -ge 2 ]; then
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H4B_SIGHUPS}" -ge 2 ]; then
+  pass "H4b: probe failure triggers explicit rollback reload"
+else
+  fail "H4b: expected forward plus rollback SIGHUPs"
+fi
+if assert_state_now "pgpooler-h4-probefail-${SUFFIX}" "plaintext"; then
+  pass "H4b: state stays plaintext"
+else
+  fail "H4b: state must remain plaintext"
+fi
+if [ -z "$(read_applied_fp "pgpooler-h4-probefail-${SUFFIX}")" ]; then
+  pass "H4b: applied stays empty"
+else
+  fail "H4b: applied must stay empty"
+fi
+_H4B_PLAIN_OK=0
+_i=0
+while [ "${_i}" -lt 30 ]; do
+  if try_connect "${H4B_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+    _H4B_PLAIN_OK=1
+    break
+  fi
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_H4B_PLAIN_OK}" = "1" ]; then
+  pass "H4b: plaintext confirmed live after rollback"
+else
+  fail "H4b: plaintext must work after rollback"
+fi
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "pgpooler-h4-probefail-${SUFFIX}"; then
+  pass "H4b: container alive after confirmed rollback"
+else
+  fail "H4b: container should stay alive after confirmed rollback"
+fi
+docker exec "pgpooler-h4-probefail-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-endpoint-verification 2>/dev/null || true
+if wait_tls_state "pgpooler-h4-probefail-${SUFFIX}" "active" 40; then
+  pass "H4b: retry succeeds after fault removed"
+else
+  fail "H4b: retry did not reach active"
+fi
+docker rm -f "pgpooler-h4-probefail-${SUFFIX}" >/dev/null 2>&1 || true
 
 # Scrub TLS temp trees (may contain test keys; never committed).
 rm -rf "${TLS_BASE}" 2>/dev/null || true

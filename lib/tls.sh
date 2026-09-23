@@ -358,9 +358,12 @@ verify_automatic_tls_config() {
   _v_cert="${2:-${TLS_RUNTIME_CERT}}"
   _v_key="${3:-${TLS_RUNTIME_KEY}}"
   [ -f "${_v_cfg}" ] || return 1
-  _v_mode_count=$(grep -c -E '^[[:space:]]*client_tls_sslmode[[:space:]]*=' "${_v_cfg}" 2>/dev/null || printf '0')
-  _v_cert_count=$(grep -c -E '^[[:space:]]*client_tls_cert_file[[:space:]]*=' "${_v_cfg}" 2>/dev/null || printf '0')
-  _v_key_count=$(grep -c -E '^[[:space:]]*client_tls_key_file[[:space:]]*=' "${_v_cfg}" 2>/dev/null || printf '0')
+  # NOTE: `grep -c` prints 0 but exits nonzero on no match, so plain
+  # `|| printf '0'` would concatenate a second 0 ("00"). Use `|| true`
+  # to keep the printed count intact.
+  _v_mode_count=$(grep -c -E '^[[:space:]]*client_tls_sslmode[[:space:]]*=' "${_v_cfg}" 2>/dev/null || true)
+  _v_cert_count=$(grep -c -E '^[[:space:]]*client_tls_cert_file[[:space:]]*=' "${_v_cfg}" 2>/dev/null || true)
+  _v_key_count=$(grep -c -E '^[[:space:]]*client_tls_key_file[[:space:]]*=' "${_v_cfg}" 2>/dev/null || true)
   # Normalize counts (grep -c prints 0 with status 1 when nothing matches).
   _v_mode_count=$(printf '%s' "${_v_mode_count}" | tr -d ' \n')
   _v_cert_count=$(printf '%s' "${_v_cert_count}" | tr -d ' \n')
@@ -435,4 +438,54 @@ verify_frontend_tls_endpoint() {
   _e_served=$(served_frontend_leaf_fp "${_e_port}" "${_e_name}" 2>/dev/null) || return 1
   [ -n "${_e_served}" ] || return 1
   [ "${_e_served}" = "${_e_expected}" ]
+}
+
+# Bounded retry wrapper around verify_frontend_tls_endpoint for paths
+# where asynchronous SIGHUP processing may need a short settle window.
+# Attempts: immediately, after 1s, after 2s more, after 2s more. Total
+# added delay stays small; no unbounded wait, no busy loop. Returns
+# success only when the expected certificate is actually served.
+verify_frontend_tls_endpoint_retry() {
+  _r_port="${1:-${LISTEN_PORT:-5432}}"
+  _r_name="${2:-localhost}"
+  if verify_frontend_tls_endpoint "${_r_port}" "${_r_name}"; then
+    return 0
+  fi
+  sleep 1 2>/dev/null || true
+  if verify_frontend_tls_endpoint "${_r_port}" "${_r_name}"; then
+    return 0
+  fi
+  sleep 2 2>/dev/null || true
+  if verify_frontend_tls_endpoint "${_r_port}" "${_r_name}"; then
+    return 0
+  fi
+  sleep 2 2>/dev/null || true
+  verify_frontend_tls_endpoint "${_r_port}" "${_r_name}"
+}
+
+# Verify that a PgBouncer config file explicitly disables frontend TLS
+# with no contradicting automatic cert/key directives. Anchored matching
+# like verify_automatic_tls_config. Returns 0 only for exactly one
+# `client_tls_sslmode = disable` line and zero cert/key file lines.
+verify_frontend_tls_disabled_config() {
+  _d_cfg="$1"
+  [ -f "${_d_cfg}" ] || return 1
+  # NOTE: `grep -c` prints 0 but exits nonzero on no match, so plain
+  # `|| printf '0'` would concatenate a second 0 ("00"). Use `|| true`
+  # to keep the printed count intact.
+  _d_mode_count=$(grep -c -E '^[[:space:]]*client_tls_sslmode[[:space:]]*=' "${_d_cfg}" 2>/dev/null || true)
+  _d_cert_count=$(grep -c -E '^[[:space:]]*client_tls_cert_file[[:space:]]*=' "${_d_cfg}" 2>/dev/null || true)
+  _d_key_count=$(grep -c -E '^[[:space:]]*client_tls_key_file[[:space:]]*=' "${_d_cfg}" 2>/dev/null || true)
+  _d_mode_count=$(printf '%s' "${_d_mode_count}" | tr -d ' \n')
+  _d_cert_count=$(printf '%s' "${_d_cert_count}" | tr -d ' \n')
+  _d_key_count=$(printf '%s' "${_d_key_count}" | tr -d ' \n')
+  if [ "${_d_mode_count}" != "1" ] || [ "${_d_cert_count}" != "0" ] || [ "${_d_key_count}" != "0" ]; then
+    return 1
+  fi
+  _d_mode=$(sed -n -E 's/^[[:space:]]*client_tls_sslmode[[:space:]]*=[[:space:]]*([^[:space:]#;]+)[[:space:]]*([#;].*)?$/\1/p' "${_d_cfg}" 2>/dev/null | tail -n 1 || printf '')
+  _d_mode=$(printf '%s' "${_d_mode}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  if [ "${_d_mode}" != "disable" ]; then
+    return 1
+  fi
+  return 0
 }

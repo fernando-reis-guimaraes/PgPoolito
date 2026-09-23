@@ -401,12 +401,33 @@ plaintext.
 frontend port proves PgBouncer serves the expected leaf certificate
 (SHA-256 X.509 fingerprint of the served chain head compared with the
 runtime leaf; bounded by `timeout`, no database credentials, no private
-keys). A delivered `SIGHUP`, a live PID, or an open TCP port alone never
-counts: PgBouncer keeps its previous TLS context when it rejects new TLS
-settings (verified live against 1.25.2), so only the served-certificate
-match gates activation, transition, and renewal. Plaintext rejection
-(`sslmode=disable` fails) is additionally asserted by live tests using
-real frontend credentials.
+keys). Because `SIGHUP` processing is asynchronous, the probe uses
+bounded retries (immediately, then after short settles) rather than a
+single shot. A delivered `SIGHUP`, a live PID, or an open TCP port alone
+never counts: PgBouncer keeps its previous TLS context when it rejects
+new TLS settings (verified live against 1.25.2), so only the
+served-certificate match gates activation, transition, and renewal.
+Plaintext rejection (`sslmode=disable` fails) is additionally asserted
+by live tests using real frontend credentials.
+
+Two failure kinds are distinguished. If the reload signal itself cannot
+be delivered, the old running state is presumed authoritative (the
+config is realigned best-effort and the watcher retries). If the signal
+is delivered but the endpoint does not confirm the new certificate, the
+live state is unknown and an explicit rollback reload plus confirmation
+is mandatory, as described above. A second, independently fault-flaggable
+reload path exists for rollbacks so tests can fail each half
+deterministically.
+
+A failed probe after a delivered reload never implies the old state
+survived: the live state is treated as unknown. Prefer transitions
+explicitly roll back (rewrite `disable`, verify the disable config,
+reload again) and publish `plaintext` only after the endpoint is
+confirmed to serve no candidate certificate; renewal restores the
+previous files, reloads them, and keeps `active` only after the previous
+certificate is observed as served again. If a rollback itself cannot be
+verified, the container stops instead of advertising a state that was
+never confirmed, keeping the last truthful files for diagnosis.
 
 ### Runtime copies and renewal
 
@@ -442,16 +463,19 @@ On renewal the new pair is validated first, the previous known-good pair
 is backed up (renewal aborts before touching the active pair if the
 backup cannot be created), files are atomically installed, PgBouncer is
 reloaded with `SIGHUP` (`RELOAD`), and the endpoint must then serve the
-new leaf; a failed reload restores the previous files (no further reload
-needed, since the running process kept the previous in-memory context),
-keeps serving the old certificate, and retries later. Active TLS is
-never automatically downgraded to plaintext. Existing client connections
-stay alive per PgBouncer semantics and new TLS handshakes receive the
-renewed certificate. Changing TLS settings triggers an automatic
-server-side `RECONNECT`; verified live against PgBouncer 1.25.2 that
-`disable -> require` applies via `SIGHUP` with new plaintext rejected
-and no container restart, and that a rejected TLS reload keeps the old
-context while the process stays alive.
+new leaf; a failed reload restores the previous files, reloads them, and
+keeps serving the old certificate only after the old leaf is observed as
+served again. If neither the new nor the restored certificate can be
+confirmed live, the container stops rather than reporting a healthy
+state it cannot prove; the backup is retained in that case (it is
+cleared only after either the new version or the rollback is confirmed).
+Active TLS is never automatically downgraded to plaintext. Existing
+client connections stay alive per PgBouncer semantics and new TLS
+handshakes receive the renewed certificate. Changing TLS settings
+triggers an automatic server-side `RECONNECT`; verified live against
+PgBouncer 1.25.2 that `disable -> require` applies via `SIGHUP` with new
+plaintext rejected and no container restart, and that a rejected TLS
+reload keeps the old context while the process stays alive.
 
 Required mode is strictly fail-closed: `waiting -> prepared` happens
 only after a valid source pair is installed and the rewritten config is
