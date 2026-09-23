@@ -1,4 +1,4 @@
-FROM edoburu/pgbouncer:1.24.0
+FROM edoburu/pgbouncer:v1.25.2-p0
 
 EXPOSE 6432
 
