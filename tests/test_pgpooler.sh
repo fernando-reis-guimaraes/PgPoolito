@@ -43,11 +43,13 @@ if command -v openssl >/dev/null 2>&1; then
   FRONTEND_PASSWORD="fe-$(openssl rand -hex 10)"
   WRONG_PASSWORD="wr-$(openssl rand -hex 10)"
   SPECIAL_BACKEND_PASSWORD="sp-$(openssl rand -hex 4) pa'ss#with;special=and\\slash"
+  SPECIAL_FRONTEND_PASSWORD="fr-$(openssl rand -hex 4) pa\"ss'with#special;chars=and\\slash"
 else
   BACKEND_PASSWORD="be-$$-$(date +%s)-test"
   FRONTEND_PASSWORD="fe-$$-$(date +%s)-test"
   WRONG_PASSWORD="wr-$$-$(date +%s)-test"
   SPECIAL_BACKEND_PASSWORD="sp-$$-$(date +%s) pa'ss#with;special=and\\slash"
+  SPECIAL_FRONTEND_PASSWORD="fr-$$-$(date +%s) pa\"ss'with#special;chars=and\\slash"
 fi
 
 SUFFIX="$(date +%s)-$$"
@@ -367,6 +369,50 @@ else
   fail "quoting failed for full specials vector"
 fi
 
+log "--- Test Q-auth: auth-file double-quote serialization ---"
+# Uses fixed non-secret vectors (not credentials): abc"def must be stored
+# as "app_user" "abc""def" under plaintext-style storage.
+docker run --rm --name "pgpooler-quoteauth1-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e "PGBOUNCER_PASSWORD=abc\"def" -e AUTH_TYPE=plain \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'grep -F "\"app_user\" \"abc\"\"def\"" /etc/pgbouncer/userlist.txt && echo QUOTEAUTH1_OK' \
+  >/tmp/pgpooler-quoteauth1-${SUFFIX}.log 2>&1 || true
+if grep -q "QUOTEAUTH1_OK" /tmp/pgpooler-quoteauth1-${SUFFIX}.log 2>/dev/null; then
+  pass "auth-file doubles literal double quotes in password"
+else
+  fail "auth-file quoting failed for password with double quote"
+fi
+# Username vector user"name must be stored as "user""name".
+# Live username test omitted: PostgreSQL roles with embedded double quotes
+# require quoted identifiers at creation and psql -U handling adds
+# ambiguity; serializer/config coverage plus PgBouncer's documented ""
+# collapsing is sufficient for usernames.
+docker run --rm --name "pgpooler-quoteauth2-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e "PGBOUNCER_USER=user\"name" -e PGBOUNCER_PASSWORD=y -e AUTH_TYPE=plain \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'grep -F "\"user\"\"name\"" /etc/pgbouncer/userlist.txt && echo QUOTEAUTH2_OK' \
+  >/tmp/pgpooler-quoteauth2-${SUFFIX}.log 2>&1 || true
+if grep -q "QUOTEAUTH2_OK" /tmp/pgpooler-quoteauth2-${SUFFIX}.log 2>/dev/null; then
+  pass "auth-file doubles literal double quotes in username"
+else
+  fail "auth-file quoting failed for username with double quote"
+fi
+log "--- Test Q-auth-CRLF: line breaks must fail fast ---"
+if docker run --rm --name "pgpooler-crlf-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e "PGBOUNCER_PASSWORD=ab
+cd" --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-crlf-${SUFFIX}.log 2>&1; then
+  fail "startup with LF in frontend password should fail"
+else
+  if grep -qi "PGBOUNCER_PASSWORD.*newline or carriage return" /tmp/pgpooler-crlf-${SUFFIX}.log 2>/dev/null; then
+    pass "LF in frontend password fails fast with named error"
+  else
+    fail "LF rejection failed without clear named error"
+  fi
+fi
+
 # ------------------------------------------------- live integration
 log "--- Live integration: starting temporary PostgreSQL ---"
 docker network create "${NET}" >/dev/null 2>&1 || true
@@ -522,6 +568,54 @@ else
   pass "no frontend password in special-char logs"
 fi
 docker rm -f "pgpooler-special-live-${SUFFIX}" "${PG_SPECIAL}" >/dev/null 2>&1 || true
+
+log "--- Test FS: special-character frontend password live (scram) ---"
+FRONT_SPECIAL_PORT=16434
+docker run -d --name "pgpooler-frontspecial-live-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${FRONT_SPECIAL_PORT}:6432" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${SPECIAL_FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer "${FRONT_SPECIAL_PORT}" "${FRONTEND_USER}" "${SPECIAL_FRONTEND_PASSWORD}"; then
+  pass "special-char frontend password ACCEPTs"
+  _u="$(query_current_user "${FRONT_SPECIAL_PORT}" "${FRONTEND_USER}" "${SPECIAL_FRONTEND_PASSWORD}")"
+  if [ "${_u}" = "${BACKEND_USER}" ]; then
+    pass "special-char frontend SELECT current_user=${BACKEND_USER}"
+  else
+    fail "special-char frontend current_user mismatch (got '${_u}')"
+  fi
+else
+  fail "special-char frontend pgbouncer did not become ready"
+  docker logs "pgpooler-frontspecial-live-${SUFFIX}" 2>&1 | head -20 || true
+fi
+if try_connect "${FRONT_SPECIAL_PORT}" "${FRONTEND_USER}" "${WRONG_PASSWORD}"; then
+  fail "wrong frontend password should be rejected (special frontend live)"
+else
+  pass "wrong frontend password rejected (special frontend live)"
+fi
+if try_connect "${FRONT_SPECIAL_PORT}" "${BACKEND_USER}" "${BACKEND_PASSWORD}"; then
+  fail "backend creds authenticated to special-frontend PgBouncer (must reject)"
+else
+  pass "backend creds REJECTed at special-frontend PgBouncer"
+fi
+docker logs "pgpooler-frontspecial-live-${SUFFIX}" >/tmp/pgpooler-frontspecial-logs-${SUFFIX}.log 2>&1 || true
+if grep -F -q "${SPECIAL_FRONTEND_PASSWORD}" /tmp/pgpooler-frontspecial-logs-${SUFFIX}.log 2>/dev/null; then
+  fail "special-char frontend password leaked into logs"
+else
+  pass "no special-char frontend password in logs"
+fi
+if grep -F -q "${BACKEND_PASSWORD}" /tmp/pgpooler-frontspecial-logs-${SUFFIX}.log 2>/dev/null; then
+  fail "backend password leaked into special-frontend logs"
+else
+  pass "no backend password in special-frontend logs"
+fi
+if docker exec "pgpooler-frontspecial-live-${SUFFIX}" sh -c 'test "$(stat -c %a /etc/pgbouncer/userlist.txt)" = "600"' >/dev/null 2>&1; then
+  pass "special-frontend userlist.txt is mode 0600"
+else
+  fail "special-frontend userlist.txt is not mode 0600"
+fi
+docker rm -f "pgpooler-frontspecial-live-${SUFFIX}" >/dev/null 2>&1 || true
 
 log "=== Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed ==="
 # Scrub temp logs (defense in depth; they may contain hashes).

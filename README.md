@@ -97,6 +97,8 @@ independent of `AUTH_TYPE`.
 Validation (fail fast, no silent fallback):
 
 * exactly one of `PGBOUNCER_USER` / `PGBOUNCER_PASSWORD` set → startup fails
+* `PGBOUNCER_USER` / `PGBOUNCER_PASSWORD` containing CR/LF → startup fails
+  (auth-file is line-oriented; values are never truncated or normalized)
 
 ### Connection-string quoting
 
@@ -104,6 +106,14 @@ In split mode string-valued `[databases]` parameters (`host`, `user`,
 `password`; `port` stays numeric) are serialized with PgBouncer/libpq
 single-quote quoting: wrapped in `'...'`, each literal `'` doubled.
 For example `abc def'ghi` becomes `'abc def''ghi'`.
+
+### Auth-file quoting
+
+Frontend `auth_file` fields use PgBouncer's double-quote serialization:
+surrounded by `"..."`, each literal `"` doubled (`abc"def` →
+`"abc""def"`). Usernames/passwords with `"` round-trip exactly under
+`plain` / `scram-sha-256` (md5 hashes are hex and unaffected but routed
+through the same serializer).
 
 ### DATABASE_URL / DATABASE_URLS
 

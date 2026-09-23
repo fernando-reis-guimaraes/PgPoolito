@@ -36,6 +36,28 @@ if [ -n "${PGBOUNCER_USER:-}" ] || [ -n "${PGBOUNCER_PASSWORD:-}" ]; then
   SPLIT_AUTH=1
 fi
 
+# True if $1 contains a literal LF or CR. The auth_file is line-oriented,
+# so such values can never be represented safely in a one-line entry.
+# Never prints the value.
+has_cr_or_lf() {
+  _cr=$(printf '\r')
+  case "$1" in
+*"
+"*|*"${_cr}"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Split-mode frontend credentials must not contain line breaks.
+if [ -n "${PGBOUNCER_USER:-}" ] && has_cr_or_lf "${PGBOUNCER_USER}"; then
+  echo "error: PGBOUNCER_USER contains a newline or carriage return and cannot be represented safely in PgBouncer auth_file" >&2
+  exit 1
+fi
+if [ -n "${PGBOUNCER_PASSWORD:-}" ] && has_cr_or_lf "${PGBOUNCER_PASSWORD}"; then
+  echo "error: PGBOUNCER_PASSWORD contains a newline or carriage return and cannot be represented safely in PgBouncer auth_file" >&2
+  exit 1
+fi
+
 # Extract all info from a given URL. Sets variables because shell functions can't return multiple values.
 #
 # Parameters:
@@ -96,6 +118,27 @@ quote_connstr_value() {
   printf "'%s%s'\n" "${_q_acc}" "${_q_rest}"
 }
 
+# Serialize a PgBouncer auth-file quoted field: double every literal `"`.
+# Distinct from quote_connstr_value(), which uses single-quote quoting for
+# [databases] connection strings. Writes only the serialized field content
+# to stdout; never logs the input. POSIX /bin/sh compatible. No eval.
+quote_authfile_field() {
+  _a_rest="$1"
+  _a_acc=""
+  while :; do
+    case "${_a_rest}" in
+      *\"*)
+        _a_acc="${_a_acc}${_a_rest%%\"*}\"\""
+        _a_rest="${_a_rest#*\"}"
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  printf '%s%s\n' "${_a_acc}" "${_a_rest}"
+}
+
 # Write a single username/password pair to the auth file, preserving the
 # existing AUTH_TYPE behavior (md5 / plain / scram-sha-256).
 # Skips empty credentials and avoids duplicate entries.
@@ -106,11 +149,20 @@ write_user_entry() {
   if [ -z "${_w_user}" ] || [ -z "${_w_pass}" ]; then
     return 0
   fi
+  # auth_file is line-oriented: reject line breaks instead of silently
+  # writing a corrupt entry. Normal legacy credentials (no CR/LF) are
+  # unaffected, so upstream compatibility is preserved for all working
+  # cases; only previously-broken values now fail fast with a clear error.
+  if has_cr_or_lf "${_w_user}" || has_cr_or_lf "${_w_pass}"; then
+    echo "error: credential contains a newline or carriage return and cannot be represented safely in PgBouncer auth_file" >&2
+    exit 1
+  fi
   if [ ! -e "${_AUTH_FILE}" ]; then
     touch "${_AUTH_FILE}"
   fi
   chmod 0600 "${_AUTH_FILE}" 2>/dev/null || true
-  if grep -q "^\"${_w_user}\"" "${_AUTH_FILE}"; then
+  _w_user_q="$(quote_authfile_field "${_w_user}")"
+  if grep -q "^\"${_w_user_q}\"" "${_AUTH_FILE}"; then
     return 0
   fi
   if [ "${AUTH_TYPE:-}" = "plain" ] || [ "${AUTH_TYPE:-}" = "scram-sha-256" ]; then
@@ -118,7 +170,7 @@ write_user_entry() {
   else
     _w_hash="md5$(printf '%s' "${_w_pass}${_w_user}" | md5sum | cut -f 1 -d ' ')"
   fi
-  printf '"%s" "%s"\n' "${_w_user}" "${_w_hash}" >> "${_AUTH_FILE}"
+  printf '"%s" "%s"\n' "$(quote_authfile_field "${_w_user}")" "$(quote_authfile_field "${_w_hash}")" >> "${_AUTH_FILE}"
   echo "Wrote authentication credentials for '${_w_user}' to ${_AUTH_FILE}"
 }
 
