@@ -413,6 +413,78 @@ else
   fi
 fi
 
+log "--- Test LIT: literal auth-file username dedup (no regex) ---"
+# Exercises the real write_user_entry() path: outer entrypoint is inert
+# (no PGBOUNCER_*/DB creds that would pre-add users); the inner call
+# prepopulates userlist.txt with safe dummy credentials, then invokes the
+# real entrypoint once with the candidate frontend credential.
+# Case 1: dot must not behave as regex wildcard.
+docker run --rm --name "pgpooler-lit1-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_NAME="${TESTDB}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'printf "\"appXuser\" \"dummy\"\n" > /etc/pgbouncer/userlist.txt; PGBOUNCER_USER="app.user" PGBOUNCER_PASSWORD=y AUTH_TYPE=plain /entrypoint.sh true >/dev/null 2>&1; grep -F -q "\"appXuser\"" /etc/pgbouncer/userlist.txt && grep -F -q "\"app.user\"" /etc/pgbouncer/userlist.txt && echo LIT1_OK' \
+  >/tmp/pgpooler-lit1-${SUFFIX}.log 2>&1 || true
+if grep -q "LIT1_OK" /tmp/pgpooler-lit1-${SUFFIX}.log 2>/dev/null; then
+  pass "dot: app.user added distinctly alongside appXuser"
+else
+  fail "dot deduplication broken (app.user vs appXuser)"
+fi
+# Case 2: star must be literal.
+docker run --rm --name "pgpooler-lit2-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_NAME="${TESTDB}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'printf "\"user123\" \"dummy\"\n" > /etc/pgbouncer/userlist.txt; PGBOUNCER_USER="user.*" PGBOUNCER_PASSWORD=y AUTH_TYPE=plain /entrypoint.sh true >/dev/null 2>&1; grep -F -q "\"user123\"" /etc/pgbouncer/userlist.txt && grep -F -q "\"user.*\"" /etc/pgbouncer/userlist.txt && echo LIT2_OK' \
+  >/tmp/pgpooler-lit2-${SUFFIX}.log 2>&1 || true
+if grep -q "LIT2_OK" /tmp/pgpooler-lit2-${SUFFIX}.log 2>/dev/null; then
+  pass "star: user.* added distinctly alongside user123"
+else
+  fail "star deduplication broken (user.* vs user123)"
+fi
+# Case 3: character class must be literal.
+docker run --rm --name "pgpooler-lit3-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_NAME="${TESTDB}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'printf "\"user1\" \"dummy\"\n" > /etc/pgbouncer/userlist.txt; PGBOUNCER_USER="user[123]" PGBOUNCER_PASSWORD=y AUTH_TYPE=plain /entrypoint.sh true >/dev/null 2>&1; grep -F -q "\"user1\"" /etc/pgbouncer/userlist.txt && grep -F -q "\"user[123]\"" /etc/pgbouncer/userlist.txt && echo LIT3_OK' \
+  >/tmp/pgpooler-lit3-${SUFFIX}.log 2>&1 || true
+if grep -q "LIT3_OK" /tmp/pgpooler-lit3-${SUFFIX}.log 2>/dev/null; then
+  pass "class: user[123] added distinctly alongside user1"
+else
+  fail "class deduplication broken (user[123] vs user1)"
+fi
+# Case 4: exact duplicate must not create a second entry.
+docker run --rm --name "pgpooler-lit4-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_NAME="${TESTDB}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'printf "\"app.user\" \"dummy\"\n" > /etc/pgbouncer/userlist.txt; PGBOUNCER_USER="app.user" PGBOUNCER_PASSWORD=y AUTH_TYPE=plain /entrypoint.sh true >/dev/null 2>&1; test "$(grep -F -c "\"app.user\"" /etc/pgbouncer/userlist.txt)" = "1" && echo LIT4_OK' \
+  >/tmp/pgpooler-lit4-${SUFFIX}.log 2>&1 || true
+if grep -q "LIT4_OK" /tmp/pgpooler-lit4-${SUFFIX}.log 2>/dev/null; then
+  pass "exact duplicate app.user detected (single entry)"
+else
+  fail "exact duplicate app.user not detected"
+fi
+# Case 5: embedded double quote (serialized "user""name") dedups exactly.
+docker run --rm --name "pgpooler-lit5-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_NAME="${TESTDB}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'printf "\"user\"\"name\" \"dummy\"\n" > /etc/pgbouncer/userlist.txt; PGBOUNCER_USER="user\"name" PGBOUNCER_PASSWORD=y AUTH_TYPE=plain /entrypoint.sh true >/dev/null 2>&1; test "$(grep -F -c "\"user\"\"name\"" /etc/pgbouncer/userlist.txt)" = "1" && echo LIT5_OK' \
+  >/tmp/pgpooler-lit5-${SUFFIX}.log 2>&1 || true
+if grep -q "LIT5_OK" /tmp/pgpooler-lit5-${SUFFIX}.log 2>/dev/null; then
+  pass "embedded quote: user\"name duplicate detected"
+else
+  fail "embedded quote deduplication broken"
+fi
+# Case 6: backslash is literal (distinct from similar names, dedups exactly).
+docker run --rm --name "pgpooler-lit6-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_NAME="${TESTDB}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'printf "\"userXname\" \"dummy\"\n" > /etc/pgbouncer/userlist.txt; PGBOUNCER_USER="user\\name" PGBOUNCER_PASSWORD=y AUTH_TYPE=plain /entrypoint.sh true >/dev/null 2>&1; grep -F -q "\"userXname\"" /etc/pgbouncer/userlist.txt && grep -F -q "\"user\\name\"" /etc/pgbouncer/userlist.txt && PGBOUNCER_USER="user\\name" PGBOUNCER_PASSWORD=y AUTH_TYPE=plain /entrypoint.sh true >/dev/null 2>&1; test "$(grep -F -c "\"user\\name\"" /etc/pgbouncer/userlist.txt)" = "1" && echo LIT6_OK' \
+  >/tmp/pgpooler-lit6-${SUFFIX}.log 2>&1 || true
+if grep -q "LIT6_OK" /tmp/pgpooler-lit6-${SUFFIX}.log 2>/dev/null; then
+  pass "backslash: user\\name literal and deduplicated"
+else
+  fail "backslash deduplication broken"
+fi
+
 # ------------------------------------------------- live integration
 log "--- Live integration: starting temporary PostgreSQL ---"
 docker network create "${NET}" >/dev/null 2>&1 || true

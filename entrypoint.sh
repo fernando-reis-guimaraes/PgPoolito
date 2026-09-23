@@ -139,6 +139,25 @@ quote_authfile_field() {
   printf '%s%s\n' "${_a_acc}" "${_a_rest}"
 }
 
+# Literal auth-file username lookup (no regex).
+# Serializes the username with quote_authfile_field(), then compares the
+# exact `"serialized-user" ` prefix (including the trailing space before
+# the password field) using shell case with the needle quoted as literal
+# data. Backslashes, regex metacharacters, and doubled quotes are all
+# preserved literally. Never logs credentials.
+authfile_has_user() {
+  _h_needle="\"$(quote_authfile_field "$1")\" "
+  [ -f "${_AUTH_FILE}" ] || return 1
+  while IFS= read -r _h_line || [ -n "${_h_line}" ]; do
+    case "${_h_line}" in
+      "${_h_needle}"*)
+        return 0
+        ;;
+    esac
+  done < "${_AUTH_FILE}"
+  return 1
+}
+
 # Write a single username/password pair to the auth file, preserving the
 # existing AUTH_TYPE behavior (md5 / plain / scram-sha-256).
 # Skips empty credentials and avoids duplicate entries.
@@ -161,8 +180,7 @@ write_user_entry() {
     touch "${_AUTH_FILE}"
   fi
   chmod 0600 "${_AUTH_FILE}" 2>/dev/null || true
-  _w_user_q="$(quote_authfile_field "${_w_user}")"
-  if grep -q "^\"${_w_user_q}\"" "${_AUTH_FILE}"; then
+  if authfile_has_user "${_w_user}"; then
     return 0
   fi
   if [ "${AUTH_TYPE:-}" = "plain" ] || [ "${AUTH_TYPE:-}" = "scram-sha-256" ]; then
