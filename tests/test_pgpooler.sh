@@ -42,10 +42,12 @@ if command -v openssl >/dev/null 2>&1; then
   BACKEND_PASSWORD="be-$(openssl rand -hex 10)"
   FRONTEND_PASSWORD="fe-$(openssl rand -hex 10)"
   WRONG_PASSWORD="wr-$(openssl rand -hex 10)"
+  SPECIAL_BACKEND_PASSWORD="sp-$(openssl rand -hex 4) pa'ss#with;special=and\\slash"
 else
   BACKEND_PASSWORD="be-$$-$(date +%s)-test"
   FRONTEND_PASSWORD="fe-$$-$(date +%s)-test"
   WRONG_PASSWORD="wr-$$-$(date +%s)-test"
+  SPECIAL_BACKEND_PASSWORD="sp-$$-$(date +%s) pa'ss#with;special=and\\slash"
 fi
 
 SUFFIX="$(date +%s)-$$"
@@ -194,7 +196,7 @@ docker run --rm --name "pgpooler-dbconf-${SUFFIX}" \
   -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
   -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
   --entrypoint /entrypoint.sh "${IMAGE}" \
-  sh -c 'grep -q " user=backend_user" /etc/pgbouncer/pgbouncer.ini && grep -q " password=" /etc/pgbouncer/pgbouncer.ini && ! grep -q " user=app_user" /etc/pgbouncer/pgbouncer.ini && ! grep -q "^testdb.*auth_user" /etc/pgbouncer/pgbouncer.ini && echo DBCONF_OK' \
+  sh -c 'grep "^testdb" /etc/pgbouncer/pgbouncer.ini | grep -q backend_user && grep "^testdb" /etc/pgbouncer/pgbouncer.ini | grep -q " password=" && ! grep "^testdb" /etc/pgbouncer/pgbouncer.ini | grep -q app_user && ! grep "^testdb" /etc/pgbouncer/pgbouncer.ini | grep -q auth_user && echo DBCONF_OK' \
   >/tmp/pgpooler-dbconf-${SUFFIX}.log 2>&1 || true
 if grep -q "DBCONF_OK" /tmp/pgpooler-dbconf-${SUFFIX}.log 2>/dev/null; then
   pass "pgbouncer.ini forces backend user with password, omits auth_user"
@@ -271,7 +273,7 @@ docker run --rm --name "pgpooler-url-${SUFFIX}" \
   -e "DATABASE_URL=postgres://${BACKEND_USER}:${BACKEND_PASSWORD}@fakehost:5432/${TESTDB}" \
   -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
   --entrypoint /entrypoint.sh "${IMAGE}" \
-  sh -c '! grep -q "\"backend_user\"" /etc/pgbouncer/userlist.txt && grep -q "\"app_user\"" /etc/pgbouncer/userlist.txt && grep -q " user=backend_user" /etc/pgbouncer/pgbouncer.ini && grep -q " password=" /etc/pgbouncer/pgbouncer.ini && echo URL_OK' \
+  sh -c '! grep -q "\"backend_user\"" /etc/pgbouncer/userlist.txt && grep -q "\"app_user\"" /etc/pgbouncer/userlist.txt && grep "^testdb" /etc/pgbouncer/pgbouncer.ini | grep -q " user=" && grep "^testdb" /etc/pgbouncer/pgbouncer.ini | grep -q backend_user && grep "^testdb" /etc/pgbouncer/pgbouncer.ini | grep -q " password=" && echo URL_OK' \
   >/tmp/pgpooler-url-${SUFFIX}.log 2>&1 || true
 if grep -q "URL_OK" /tmp/pgpooler-url-${SUFFIX}.log 2>/dev/null; then
   pass "DATABASE_URL split entry isolates backend and forces user/password"
@@ -289,7 +291,7 @@ docker run --rm --name "pgpooler-urls-${SUFFIX}" \
   -e "DATABASE_URLS=postgres://foo:foopass@fakehost/foo,postgres://bar:barpass@fakehost/bar" \
   -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
   --entrypoint /entrypoint.sh "${IMAGE}" \
-  sh -c '! grep -q "\"foo\"" /etc/pgbouncer/userlist.txt && ! grep -q "\"bar\"" /etc/pgbouncer/userlist.txt && grep -q "\"app_user\"" /etc/pgbouncer/userlist.txt && grep -q " user=foo" /etc/pgbouncer/pgbouncer.ini && grep -q " user=bar" /etc/pgbouncer/pgbouncer.ini && echo URLS_OK' \
+  sh -c '! grep -q "\"foo\"" /etc/pgbouncer/userlist.txt && ! grep -q "\"bar\"" /etc/pgbouncer/userlist.txt && grep -q "\"app_user\"" /etc/pgbouncer/userlist.txt && grep "^foo" /etc/pgbouncer/pgbouncer.ini | grep -q " user=" && grep "^bar" /etc/pgbouncer/pgbouncer.ini | grep -q " user=" && echo URLS_OK' \
   >/tmp/pgpooler-urls-${SUFFIX}.log 2>&1 || true
 if grep -q "URLS_OK" /tmp/pgpooler-urls-${SUFFIX}.log 2>/dev/null; then
   pass "DATABASE_URLS split isolates backends and forces each user"
@@ -315,6 +317,55 @@ for _at in md5 plain scram-sha-256; do
     fail "AUTH_TYPE=${_at} container run failed"
   fi
 done
+
+log "--- Test Q: connstr quoting (space, quote, specials) ---"
+# Q1: password with space + single quote must serialize as 'abc def''ghi'.
+docker run --rm --name "pgpooler-quote1-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e "DB_PASSWORD=abc def'ghi" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c "grep -F \"password='abc def''ghi'\" /etc/pgbouncer/pgbouncer.ini && echo QUOTE1_OK" \
+  >/tmp/pgpooler-quote1-${SUFFIX}.log 2>&1 || true
+if grep -q "QUOTE1_OK" /tmp/pgpooler-quote1-${SUFFIX}.log 2>/dev/null; then
+  pass "quoting serializes password with space+quote"
+else
+  fail "quoting failed for password with space+quote"
+fi
+# Q2/Q3: backend usernames requiring quoting (config-level).
+docker run --rm --name "pgpooler-quote2-${SUFFIX}" \
+  -e DB_HOST=fakehost -e "DB_USER=user name" -e DB_PASSWORD=x -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c "grep -F \"user='user name'\" /etc/pgbouncer/pgbouncer.ini && echo QUOTE2_OK" \
+  >/tmp/pgpooler-quote2-${SUFFIX}.log 2>&1 || true
+if grep -q "QUOTE2_OK" /tmp/pgpooler-quote2-${SUFFIX}.log 2>/dev/null; then
+  pass "quoting serializes username with space"
+else
+  fail "quoting failed for username with space"
+fi
+docker run --rm --name "pgpooler-quote3-${SUFFIX}" \
+  -e DB_HOST=fakehost -e "DB_USER=user'name" -e DB_PASSWORD=x -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c "grep -F \"user='user''name'\" /etc/pgbouncer/pgbouncer.ini && echo QUOTE3_OK" \
+  >/tmp/pgpooler-quote3-${SUFFIX}.log 2>&1 || true
+if grep -q "QUOTE3_OK" /tmp/pgpooler-quote3-${SUFFIX}.log 2>/dev/null; then
+  pass "quoting serializes username with single quote"
+else
+  fail "quoting failed for username with single quote"
+fi
+# Q4: full specials vector a b'c#d;e=f\g.
+docker run --rm --name "pgpooler-quote4-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e "DB_PASSWORD=a b'c#d;e=f\\g" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c "grep -F \"password='a b''c#d;e=f\\\\g'\" /etc/pgbouncer/pgbouncer.ini && echo QUOTE4_OK" \
+  >/tmp/pgpooler-quote4-${SUFFIX}.log 2>&1 || true
+if grep -q "QUOTE4_OK" /tmp/pgpooler-quote4-${SUFFIX}.log 2>/dev/null; then
+  pass "quoting serializes full specials vector"
+else
+  fail "quoting failed for full specials vector"
+fi
 
 # ------------------------------------------------- live integration
 log "--- Live integration: starting temporary PostgreSQL ---"
@@ -414,6 +465,63 @@ else
   fail "live pgbouncer.ini is not mode 0600"
 fi
 docker rm -f "pgpooler-split-live-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test S: special-character backend password live ---"
+PG_SPECIAL="pgpooler-special-pg-${SUFFIX}"
+SPECIAL_PORT=16433
+docker run -d --name "${PG_SPECIAL}" --network "${NET}" \
+  -e "POSTGRES_USER=${BACKEND_USER}" -e "POSTGRES_PASSWORD=${SPECIAL_BACKEND_PASSWORD}" -e "POSTGRES_DB=${TESTDB}" \
+  postgres:17 >/dev/null
+_SPECIAL_READY=0
+_tries=0
+while [ "${_tries}" -lt 30 ]; do
+  if docker exec "${PG_SPECIAL}" pg_isready -U "${BACKEND_USER}" >/dev/null 2>&1; then
+    _SPECIAL_READY=1
+    break
+  fi
+  _tries=$((_tries + 1))
+  sleep 1
+done
+if [ "${_SPECIAL_READY}" = "1" ]; then
+  pass "special-char PostgreSQL is ready"
+else
+  fail "special-char PostgreSQL did not become ready"
+fi
+docker run -d --name "pgpooler-special-live-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${SPECIAL_PORT}:6432" \
+  -e DB_HOST="${PG_SPECIAL}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${SPECIAL_BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer "${SPECIAL_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "special-char frontend ACCEPTs"
+  _u="$(query_current_user "${SPECIAL_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}")"
+  if [ "${_u}" = "${BACKEND_USER}" ]; then
+    pass "special-char SELECT current_user=${BACKEND_USER}"
+  else
+    fail "special-char current_user mismatch (got '${_u}')"
+  fi
+else
+  fail "special-char pgbouncer did not become ready"
+  docker logs "pgpooler-special-live-${SUFFIX}" 2>&1 | head -20 || true
+fi
+if try_connect "${SPECIAL_PORT}" "${BACKEND_USER}" "${SPECIAL_BACKEND_PASSWORD}"; then
+  fail "special-char backend creds authenticated to PgBouncer (must reject)"
+else
+  pass "special-char backend creds REJECTed as frontend"
+fi
+docker logs "pgpooler-special-live-${SUFFIX}" >/tmp/pgpooler-special-logs-${SUFFIX}.log 2>&1 || true
+if grep -F -q "${SPECIAL_BACKEND_PASSWORD}" /tmp/pgpooler-special-logs-${SUFFIX}.log 2>/dev/null; then
+  fail "special-char backend password leaked into logs"
+else
+  pass "no special-char backend password in logs"
+fi
+if grep -F -q "${FRONTEND_PASSWORD}" /tmp/pgpooler-special-logs-${SUFFIX}.log 2>/dev/null; then
+  fail "frontend password leaked into special-char logs"
+else
+  pass "no frontend password in special-char logs"
+fi
+docker rm -f "pgpooler-special-live-${SUFFIX}" "${PG_SPECIAL}" >/dev/null 2>&1 || true
 
 log "=== Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed ==="
 # Scrub temp logs (defense in depth; they may contain hashes).

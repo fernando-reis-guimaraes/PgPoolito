@@ -41,6 +41,11 @@ fi
 # Parameters:
 #   - The url we should parse
 # Returns (sets variables): DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME
+# Limitation (upstream parser, preserved): credentials are split naively on
+# `:`, `@`, `/`, `,`. Passwords containing those characters (or requiring
+# percent-encoding) may misparse; prefer separate DB_* variables for such
+# credentials. Parsed values are safely re-serialized on output, but a
+# misparsed value cannot be recovered. Never logs the URL.
 parse_url() {
   # Thanks to https://stackoverflow.com/a/17287984/146289
 
@@ -68,6 +73,27 @@ parse_url() {
   fi
 
   DB_NAME="$(echo $url | grep / | cut -d/ -f2-)"
+}
+
+# Serialize a value as a PgBouncer/libpq-style connection-string value:
+# surround with single quotes, double every literal single quote.
+# Preserves all other characters verbatim. Writes only the serialized
+# value to stdout; never logs the input. POSIX /bin/sh compatible.
+quote_connstr_value() {
+  _q_rest="$1"
+  _q_acc=""
+  while :; do
+    case "${_q_rest}" in
+      *\'*)
+        _q_acc="${_q_acc}${_q_rest%%\'*}''"
+        _q_rest="${_q_rest#*\'}"
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  printf "'%s%s'\n" "${_q_acc}" "${_q_rest}"
 }
 
 # Write a single username/password pair to the auth file, preserving the
@@ -116,24 +142,27 @@ ensure_frontend_auth() {
 }
 
 # Grabs variables set by `parse_url` and adds them to the PG config file as a database entry.
-# Legacy mode: upstream format unchanged (auth_user only).
+# Legacy mode: upstream format unchanged (auth_user only, unquoted).
 # Split mode: native backend `user=` + `password=` WITHOUT per-database
 # `auth_user`, otherwise PgBouncer would still accept the backend user as
-# a frontend login (isolation breach). Global AUTH_USER handling unchanged.
+# a frontend login (isolation breach). String-valued connstr parameters
+# (host/user/password) are single-quote serialized; port stays numeric.
+# Global AUTH_USER handling unchanged.
 generate_config_db_entry() {
   if [ "${SPLIT_AUTH}" = "1" ]; then
+    _q_host="$(quote_connstr_value "${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"}")"
     if [ -n "${DB_USER:-}" ]; then
-      _forced_user=" user=${DB_USER}"
+      _forced_user=" user=$(quote_connstr_value "${DB_USER}")"
     else
       _forced_user=""
     fi
     if [ -n "${DB_PASSWORD:-}" ]; then
-      _backend_password=" password=${DB_PASSWORD}"
+      _backend_password=" password=$(quote_connstr_value "${DB_PASSWORD}")"
     else
       _backend_password=""
     fi
     printf "\
-${DB_NAME:-*} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} \
+${DB_NAME:-*} = host=${_q_host} \
 port=${DB_PORT:-5432}${_forced_user}${_backend_password}
 ${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
 " >> "${PG_CONFIG_FILE}"

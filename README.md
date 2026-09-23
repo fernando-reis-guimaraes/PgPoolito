@@ -98,14 +98,29 @@ Validation (fail fast, no silent fallback):
 
 * exactly one of `PGBOUNCER_USER` / `PGBOUNCER_PASSWORD` set → startup fails
 
+### Connection-string quoting
+
+In split mode string-valued `[databases]` parameters (`host`, `user`,
+`password`; `port` stays numeric) are serialized with PgBouncer/libpq
+single-quote quoting: wrapped in `'...'`, each literal `'` doubled.
+For example `abc def'ghi` becomes `'abc def''ghi'`.
+
 ### DATABASE_URL / DATABASE_URLS
 
 Upstream `DATABASE_URL`, `DATABASE_URLS`, and separate `DB_*` support is
 preserved. Split frontend credentials are global PgBouncer client
 credentials; each backend entry parsed from a URL keeps its own
-backend username/password and generates its own `user=` + `password=`.
+backend username/password and generates its own `user=` + `password=`
+(safely quoted on output).
 Backend users are never added to the frontend `auth_file`. Take care
 not to log URLs containing passwords.
+
+URL parser limitation (upstream behavior, preserved): credentials are
+split naively on `:`, `@`, `/`, `,`. Passwords containing those
+characters, or requiring percent-encoding, may misparse from
+`DATABASE_URL`/`DATABASE_URLS`; prefer separate `DB_*` variables for
+such credentials. `DB_*` values with spaces, `'`, `#`, `;`, `=`, `\`
+are supported via quoting.
 
 Limitation: when `DATABASE_URLS` is combined with split credentials,
 use distinct database names per URL. Overlapping or wildcard (`*`)
