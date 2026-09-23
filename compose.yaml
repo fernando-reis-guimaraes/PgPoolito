@@ -1,0 +1,9 @@
+services:
+  aulas-pooler:
+    image: cr.umapps.net/umapps/pgpooler:${IMAGE_TAG:-beta}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+        - linux/arm64
