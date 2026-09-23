@@ -9,7 +9,17 @@ CAPROVER_BASE="/caprover-letsencrypt"
 TLS_RUNTIME_DIR="/run/pgbouncer/tls"
 TLS_RUNTIME_CERT="${TLS_RUNTIME_DIR}/fullchain.pem"
 TLS_RUNTIME_KEY="${TLS_RUNTIME_DIR}/privkey.pem"
-TLS_FINGERPRINT_FILE="${TLS_RUNTIME_DIR}/.fingerprint"
+# Applied fingerprint: content fingerprint of the source certificate/key
+# pair that was last CONFIRMED applied to the running PgBouncer, not merely
+# copied to disk. It advances only after the full sequence succeeds
+# (install + config rewrite + config verification + reload or verified
+# process start). A failed step leaves it unchanged so the next polling
+# iteration retries the same source version.
+TLS_APPLIED_FILE="${TLS_RUNTIME_DIR}/.fingerprint"
+# Previous known-good runtime pair, kept only across a renewal reload
+# attempt so a failed reload can restore the last working files.
+TLS_PREV_CERT="${TLS_RUNTIME_DIR}/.fullchain.pem.prev"
+TLS_PREV_KEY="${TLS_RUNTIME_DIR}/.privkey.pem.prev"
 
 # Validate PUBLIC_HOST as a single DNS hostname.
 # Prints the sanitized value on success, returns 1 on failure.
@@ -188,8 +198,11 @@ validate_caprover_cert() {
   return 0
 }
 
-# Atomically install validated source cert/key into the private runtime dir.
-# Sets 0600 postgres ownership on runtime copies. Source files untouched.
+# Atomically install a validated source cert/key into the private runtime
+# dir. Sets 0600 postgres ownership on runtime copies. Source files are
+# never modified. This step alone does NOT mark the version applied; the
+# caller must complete config rewrite, verification, and reload (or a
+# verified process start) and then call commit_applied_fingerprint.
 # Args: src_cert src_key ; run as root. Never prints secrets.
 install_runtime_cert() {
   _i_cert="$1"
@@ -229,20 +242,111 @@ install_runtime_cert() {
   if id postgres >/dev/null 2>&1; then
     chown postgres:postgres "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null || true
   fi
-  # Record content fingerprint for renewal detection.
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null | awk '{print $1}' | tr '\n' ':' > "${TLS_FINGERPRINT_FILE}.tmp" 2>/dev/null || true
-    mv -f "${TLS_FINGERPRINT_FILE}.tmp" "${TLS_FINGERPRINT_FILE}" 2>/dev/null || true
-    chmod 0600 "${TLS_FINGERPRINT_FILE}" 2>/dev/null || true
+  return 0
+}
+
+# Save the current runtime pair as the previous known-good backup.
+# Best effort; failures are non-fatal for the caller to judge.
+backup_runtime_cert() {
+  if [ -f "${TLS_RUNTIME_CERT}" ] && [ -f "${TLS_RUNTIME_KEY}" ]; then
+    cp -f "${TLS_RUNTIME_CERT}" "${TLS_PREV_CERT}" 2>/dev/null || return 1
+    cp -f "${TLS_RUNTIME_KEY}" "${TLS_PREV_KEY}" 2>/dev/null || return 1
+    chmod 0600 "${TLS_PREV_CERT}" "${TLS_PREV_KEY}" 2>/dev/null || true
   fi
   return 0
 }
 
-# Read stored runtime fingerprint (empty when none).
-read_runtime_fingerprint() {
-  if [ -f "${TLS_FINGERPRINT_FILE}" ]; then
-    tr -d '\n' < "${TLS_FINGERPRINT_FILE}" 2>/dev/null || printf ''
+# Restore the previous known-good runtime pair after a failed reload.
+# Best effort; the running PgBouncer keeps its previous in-memory TLS
+# context regardless, so no reload is issued here.
+restore_runtime_cert_backup() {
+  if [ -f "${TLS_PREV_CERT}" ] && [ -f "${TLS_PREV_KEY}" ]; then
+    cp -f "${TLS_PREV_CERT}" "${TLS_RUNTIME_CERT}" 2>/dev/null || return 1
+    cp -f "${TLS_PREV_KEY}" "${TLS_RUNTIME_KEY}" 2>/dev/null || return 1
+    chmod 0600 "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null || true
+    if id postgres >/dev/null 2>&1; then
+      chown postgres:postgres "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null || true
+    fi
+  fi
+  return 0
+}
+
+# Drop the previous-pair backup (fewer private-key copies on disk).
+clear_runtime_cert_backup() {
+  rm -f "${TLS_PREV_CERT}" "${TLS_PREV_KEY}" 2>/dev/null || true
+  return 0
+}
+
+# Record the source pair fingerprint as successfully applied. Call only
+# after the version is confirmed live (config verified plus reload
+# delivered to a surviving process, or a verified fresh process start).
+# Args: src_cert src_key. Never prints secrets.
+commit_applied_fingerprint() {
+  _c_fp=$(source_fingerprint "$1" "$2" 2>/dev/null) || return 1
+  if [ -z "${_c_fp}" ]; then
+    return 1
+  fi
+  printf '%s' "${_c_fp}" > "${TLS_APPLIED_FILE}.tmp" 2>/dev/null || return 1
+  mv -f "${TLS_APPLIED_FILE}.tmp" "${TLS_APPLIED_FILE}" 2>/dev/null || return 1
+  chmod 0600 "${TLS_APPLIED_FILE}" 2>/dev/null || true
+  if id postgres >/dev/null 2>&1; then
+    chown postgres:postgres "${TLS_APPLIED_FILE}" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Read the stored applied fingerprint (empty when nothing applied yet).
+read_applied_fingerprint() {
+  if [ -f "${TLS_APPLIED_FILE}" ]; then
+    tr -d '\n' < "${TLS_APPLIED_FILE}" 2>/dev/null || printf ''
   else
     printf ''
   fi
+}
+
+# Forget the applied version (used when reverting a failed activation).
+clear_applied_fingerprint() {
+  rm -f "${TLS_APPLIED_FILE}" 2>/dev/null || true
+  return 0
+}
+
+# Verify that a PgBouncer config file carries exactly the expected
+# automatic frontend TLS identity. Matching is anchored per line so
+# comments or malformed values cannot satisfy the check. Values are
+# compared as literal strings after trimming surrounding whitespace.
+# Args: config_file [expected_cert_file] [expected_key_file].
+# Returns 0 only when sslmode is exactly `require` (single directive)
+# and both paths match exactly (single directive each).
+verify_automatic_tls_config() {
+  _v_cfg="$1"
+  _v_cert="${2:-${TLS_RUNTIME_CERT}}"
+  _v_key="${3:-${TLS_RUNTIME_KEY}}"
+  [ -f "${_v_cfg}" ] || return 1
+  _v_mode_count=$(grep -c -E '^[[:space:]]*client_tls_sslmode[[:space:]]*=' "${_v_cfg}" 2>/dev/null || printf '0')
+  _v_cert_count=$(grep -c -E '^[[:space:]]*client_tls_cert_file[[:space:]]*=' "${_v_cfg}" 2>/dev/null || printf '0')
+  _v_key_count=$(grep -c -E '^[[:space:]]*client_tls_key_file[[:space:]]*=' "${_v_cfg}" 2>/dev/null || printf '0')
+  # Normalize counts (grep -c prints 0 with status 1 when nothing matches).
+  _v_mode_count=$(printf '%s' "${_v_mode_count}" | tr -d ' \n')
+  _v_cert_count=$(printf '%s' "${_v_cert_count}" | tr -d ' \n')
+  _v_key_count=$(printf '%s' "${_v_key_count}" | tr -d ' \n')
+  if [ "${_v_mode_count}" != "1" ] || [ "${_v_cert_count}" != "1" ] || [ "${_v_key_count}" != "1" ]; then
+    return 1
+  fi
+  _v_mode=$(sed -n -E 's/^[[:space:]]*client_tls_sslmode[[:space:]]*=[[:space:]]*([^[:space:]#;]+)[[:space:]]*([#;].*)?$/\1/p' "${_v_cfg}" 2>/dev/null | tail -n 1 || printf '')
+  _v_cert_val=$(sed -n -E 's/^[[:space:]]*client_tls_cert_file[[:space:]]*=[[:space:]]*([^#;]+[^#; ])[[:space:]]*([#;].*)?$/\1/p' "${_v_cfg}" 2>/dev/null | tail -n 1 || printf '')
+  _v_key_val=$(sed -n -E 's/^[[:space:]]*client_tls_key_file[[:space:]]*=[[:space:]]*([^#;]+[^#; ])[[:space:]]*([#;].*)?$/\1/p' "${_v_cfg}" 2>/dev/null | tail -n 1 || printf '')
+  # Trim residual surrounding whitespace without touching inner content.
+  _v_mode=$(printf '%s' "${_v_mode}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  _v_cert_val=$(printf '%s' "${_v_cert_val}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  _v_key_val=$(printf '%s' "${_v_key_val}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  if [ "${_v_mode}" != "require" ]; then
+    return 1
+  fi
+  if [ "${_v_cert_val}" != "${_v_cert}" ]; then
+    return 1
+  fi
+  if [ "${_v_key_val}" != "${_v_key}" ]; then
+    return 1
+  fi
+  return 0
 }

@@ -1601,6 +1601,456 @@ else
 fi
 docker rm -f "pgpooler-manual-tls-${SUFFIX}" >/dev/null 2>&1 || true
 
+# ================================================== Fault-injection (F)
+# Deterministic fail-closed regression tests. The image supports two
+# test-only runtime fault flags (plain files, absent by default, never
+# secrets) that the test harness creates/removes inside a running
+# container; production behavior is unchanged when they are absent:
+#   /run/pgbouncer/.fail-tls-config-update -> config rewrite fails
+#   /run/pgbouncer/.fail-tls-reload        -> SIGHUP/reload fails
+# Applied-fingerprint semantics under test:
+#   applied = source version confirmed live (config verified + reload
+#   delivered to a surviving process, or verified fresh start). Any
+#   failure leaves it unchanged so the next poll retries the same source.
+
+# Read the applied fingerprint recorded inside a container (may be empty).
+read_applied_fp() {
+  docker exec "$1" cat /run/pgbouncer/tls/.fingerprint 2>/dev/null || printf ''
+}
+# Content fingerprint of the mounted source pair, computed inside the
+# container so the format always matches the watcher implementation.
+src_fp_in_container() {
+  docker exec "$1" sh -c 'sha256sum "/caprover-letsencrypt/live/'"$2"'/fullchain.pem" "/caprover-letsencrypt/live/'"$2"'/privkey.pem" 2>/dev/null | awk "{print \$1}" | tr "\n" ":"' 2>/dev/null || printf ''
+}
+# Immediate single-read state assertion (no waiting).
+assert_state_now() {
+  _as_c="$1"; _as_exp="$2"
+  _as_got=$(docker exec "${_as_c}" cat /run/pgbouncer/pgpooler.state 2>/dev/null | grep '^TLS_STATE=' | cut -d= -f2- || printf '')
+  [ "${_as_got}" = "${_as_exp}" ]
+}
+assert_expect_now() {
+  _ae_c="$1"; _ae_exp="$2"
+  _ae_got=$(docker exec "${_ae_c}" cat /run/pgbouncer/pgpooler.state 2>/dev/null | grep '^EXPECT_PGBOUNCER=' | cut -d= -f2- || printf '')
+  [ "${_ae_got}" = "${_ae_exp}" ]
+}
+# Wait until TLS require works (up to ~15s); for post-activation probes
+# where the parent may still be starting PgBouncer.
+wait_tls_require() {
+  _wtr_hp="$1"; _wtr_u="$2"; _wtr_p="$3"
+  _wtr_t=0
+  while [ "${_wtr_t}" -lt 15 ]; do
+    if tls_require_connect "${_wtr_hp}" "${_wtr_u}" "${_wtr_p}"; then
+      return 0
+    fi
+    sleep 1
+    _wtr_t=$((_wtr_t + 1))
+  done
+  return 1
+}
+
+log "--- Test F1: required config-update failure stays fail-closed, then retries ---"
+TLS_F1_DIR="${TLS_BASE}/f1"
+TLS_F1_TREE="${TLS_BASE}/f1-tree"
+F1_PORT=16444
+F1_UI=18044
+mkdir -p "${TLS_F1_TREE}/live/localhost" 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_F1_DIR}"; then
+  pass "F1 cert generated (not yet installed)"
+else
+  fail "F1 cert generation failed"
+fi
+docker run -d --name "pgpooler-f1-req-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${F1_PORT}:6432" -p "127.0.0.1:${F1_UI}:8080" \
+  -v "${TLS_F1_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=required -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_tls_state "pgpooler-f1-req-${SUFFIX}" "waiting" 15; then
+  pass "F1: initial waiting state"
+else
+  fail "F1: did not reach waiting state"
+fi
+_F1_ID_BEFORE=$(docker inspect "pgpooler-f1-req-${SUFFIX}" --format '{{.Id}}' 2>/dev/null || printf '')
+# Inject config-update failure, then deliver the certificate.
+docker exec "pgpooler-f1-req-${SUFFIX}" touch /run/pgbouncer/.fail-tls-config-update 2>/dev/null || true
+install_test_cert "${TLS_F1_DIR}" "${TLS_F1_TREE}" "localhost" || true
+sleep 12
+if assert_state_now "pgpooler-f1-req-${SUFFIX}" "waiting"; then
+  pass "F1: failed rewrite leaves state waiting (not active)"
+else
+  fail "F1: state must remain waiting after rewrite failure"
+fi
+if assert_expect_now "pgpooler-f1-req-${SUFFIX}" "0"; then
+  pass "F1: EXPECT_PGBOUNCER stays 0 after rewrite failure"
+else
+  fail "F1: EXPECT_PGBOUNCER must stay 0 after rewrite failure"
+fi
+if PGPASSWORD="${FRONTEND_PASSWORD}" psql -X -q -h 127.0.0.1 -p "${F1_PORT}" -U "${FRONTEND_USER}" -d "${TESTDB}" -tA -c "SELECT 1;" "connect_timeout=3" >/dev/null 2>&1; then
+  fail "F1: listener must stay unavailable after rewrite failure"
+else
+  pass "F1: listener unavailable after rewrite failure (fail-closed)"
+fi
+if fetch_ui "${F1_UI}" "/tmp/pgpooler-f1-ui-${SUFFIX}.html"; then
+  if grep -q "Required - waiting for certificate" "/tmp/pgpooler-f1-ui-${SUFFIX}.html" 2>/dev/null; then
+    pass "F1: UI still reports waiting (no false active)"
+  else
+    fail "F1: UI must not claim active after rewrite failure"
+  fi
+  rm -f "/tmp/pgpooler-f1-ui-${SUFFIX}.html" 2>/dev/null || true
+else
+  fail "F1: UI fetch failed"
+fi
+_F1_APPLIED=$(read_applied_fp "pgpooler-f1-req-${SUFFIX}")
+if [ -z "${_F1_APPLIED}" ]; then
+  pass "F1: applied fingerprint not advanced on failure"
+else
+  fail "F1: applied fingerprint must not advance on failure"
+fi
+# Remove the fault: the next poll must retry and succeed in place.
+docker exec "pgpooler-f1-req-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-config-update 2>/dev/null || true
+if wait_tls_state "pgpooler-f1-req-${SUFFIX}" "active" 30; then
+  pass "F1: retry succeeds after fault removed"
+else
+  fail "F1: retry did not reach active"
+fi
+if wait_tls_require "${F1_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "F1: TLS works after retry"
+else
+  fail "F1: TLS should work after retry"
+fi
+if tls_disable_connect "${F1_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  fail "F1: plaintext must be rejected after retry"
+else
+  pass "F1: plaintext rejected after retry (no window)"
+fi
+_F1_EXPECTED=$(src_fp_in_container "pgpooler-f1-req-${SUFFIX}" "localhost")
+_F1_APPLIED_AFTER=$(read_applied_fp "pgpooler-f1-req-${SUFFIX}")
+if [ -n "${_F1_EXPECTED}" ] && [ "${_F1_EXPECTED}" = "${_F1_APPLIED_AFTER}" ]; then
+  pass "F1: applied fingerprint committed only on success"
+else
+  fail "F1: applied fingerprint should equal source after success"
+fi
+_F1_ID_AFTER=$(docker inspect "pgpooler-f1-req-${SUFFIX}" --format '{{.Id}}' 2>/dev/null || printf '')
+if [ -n "${_F1_ID_BEFORE}" ] && [ "${_F1_ID_BEFORE}" = "${_F1_ID_AFTER}" ]; then
+  pass "F1: container did not restart across failure+retry"
+else
+  fail "F1: container must not restart"
+fi
+docker rm -f "pgpooler-f1-req-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test F2: prefer reload failure does not claim active, then retries ---"
+TLS_F2_DIR="${TLS_BASE}/f2"
+TLS_F2_TREE="${TLS_BASE}/f2-tree"
+F2_PORT=16445
+F2_UI=18045
+mkdir -p "${TLS_F2_TREE}/live/localhost" 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_F2_DIR}"; then
+  pass "F2 cert generated (not yet installed)"
+else
+  fail "F2 cert generation failed"
+fi
+docker run -d --name "pgpooler-f2-prefer-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${F2_PORT}:6432" -p "127.0.0.1:${F2_UI}:8080" \
+  -v "${TLS_F2_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer "${F2_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "F2: initial plaintext works"
+else
+  fail "F2: initial plaintext did not start"
+fi
+docker exec "pgpooler-f2-prefer-${SUFFIX}" touch /run/pgbouncer/.fail-tls-reload 2>/dev/null || true
+install_test_cert "${TLS_F2_DIR}" "${TLS_F2_TREE}" "localhost" || true
+sleep 12
+if assert_state_now "pgpooler-f2-prefer-${SUFFIX}" "plaintext"; then
+  pass "F2: failed reload leaves state plaintext (not active)"
+else
+  fail "F2: state must remain plaintext after reload failure"
+fi
+if fetch_ui "${F2_UI}" "/tmp/pgpooler-f2-ui-${SUFFIX}.html"; then
+  if grep -q "Not available - plaintext currently enabled" "/tmp/pgpooler-f2-ui-${SUFFIX}.html" 2>/dev/null; then
+    pass "F2: UI still reports plaintext (no false active)"
+  else
+    fail "F2: UI must not claim active after reload failure"
+  fi
+  rm -f "/tmp/pgpooler-f2-ui-${SUFFIX}.html" 2>/dev/null || true
+else
+  fail "F2: UI fetch failed"
+fi
+_F2_APPLIED=$(read_applied_fp "pgpooler-f2-prefer-${SUFFIX}")
+if [ -z "${_F2_APPLIED}" ]; then
+  pass "F2: applied fingerprint not advanced on reload failure"
+else
+  fail "F2: applied fingerprint must not advance on reload failure"
+fi
+if try_connect "${F2_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "F2: plaintext still served after reload failure (no outage)"
+else
+  fail "F2: plaintext should still work after reload failure"
+fi
+docker exec "pgpooler-f2-prefer-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-reload 2>/dev/null || true
+if wait_tls_state "pgpooler-f2-prefer-${SUFFIX}" "active" 30; then
+  pass "F2: retry succeeds after fault removed"
+else
+  fail "F2: retry did not reach active"
+fi
+sleep 2
+if tls_disable_connect "${F2_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  fail "F2: plaintext must be rejected after retry"
+else
+  pass "F2: plaintext rejected after retry"
+fi
+if tls_require_connect "${F2_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "F2: TLS works after retry"
+else
+  fail "F2: TLS should work after retry"
+fi
+docker rm -f "pgpooler-f2-prefer-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test F3: renewal reload failure keeps serving A, then retries to B ---"
+TLS_F3A_DIR="${TLS_BASE}/f3a"
+TLS_F3B_DIR="${TLS_BASE}/f3b"
+TLS_F3_TREE="${TLS_BASE}/f3-tree"
+F3_PORT=16446
+F3_UI=18046
+if make_test_cert "localhost" "${TLS_F3A_DIR}" && install_test_cert "${TLS_F3A_DIR}" "${TLS_F3_TREE}" "localhost"; then
+  pass "F3 cert A installed"
+else
+  fail "F3 cert A setup failed"
+fi
+docker run -d --name "pgpooler-f3-renew-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${F3_PORT}:6432" -p "127.0.0.1:${F3_UI}:8080" \
+  -v "${TLS_F3_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+sleep 6
+if tls_require_connect "${F3_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "F3: initial TLS works (cert A)"
+else
+  fail "F3: initial TLS failed"
+fi
+_F3_FP_A=$(tls_fingerprint "${F3_PORT}" "localhost")
+_F3_APPLIED_A=$(read_applied_fp "pgpooler-f3-renew-${SUFFIX}")
+_F3_SRC_A=$(src_fp_in_container "pgpooler-f3-renew-${SUFFIX}" "localhost")
+if [ -n "${_F3_FP_A}" ] && [ -n "${_F3_APPLIED_A}" ] && [ "${_F3_APPLIED_A}" = "${_F3_SRC_A}" ]; then
+  pass "F3: applied fingerprint tracks cert A"
+else
+  fail "F3: applied fingerprint should equal source A"
+fi
+_F3_ID_BEFORE=$(docker inspect "pgpooler-f3-renew-${SUFFIX}" --format '{{.Id}}' 2>/dev/null || printf '')
+docker exec "pgpooler-f3-renew-${SUFFIX}" touch /run/pgbouncer/.fail-tls-reload 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_F3B_DIR}"; then
+  pass "F3 cert B generated"
+else
+  fail "F3 cert B generation failed"
+fi
+install_test_cert "${TLS_F3B_DIR}" "${TLS_F3_TREE}" "localhost" || true
+sleep 12
+_F3_FP_STILL=$(tls_fingerprint "${F3_PORT}" "localhost")
+if [ -n "${_F3_FP_STILL}" ] && [ "${_F3_FP_STILL}" = "${_F3_FP_A}" ]; then
+  pass "F3: failed reload keeps serving cert A (no poisoning)"
+else
+  fail "F3: new connections must still receive cert A after reload failure"
+fi
+_F3_APPLIED_STILL=$(read_applied_fp "pgpooler-f3-renew-${SUFFIX}")
+if [ "${_F3_APPLIED_STILL}" = "${_F3_APPLIED_A}" ]; then
+  pass "F3: applied fingerprint remains A after reload failure"
+else
+  fail "F3: applied fingerprint must remain A after reload failure"
+fi
+if assert_state_now "pgpooler-f3-renew-${SUFFIX}" "active"; then
+  pass "F3: state remains active after reload failure"
+else
+  fail "F3: state must remain active after reload failure"
+fi
+if tls_require_connect "${F3_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "F3: TLS still works after reload failure"
+else
+  fail "F3: TLS should still work after reload failure"
+fi
+docker exec "pgpooler-f3-renew-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-reload 2>/dev/null || true
+_F3_FP_B=""
+_tries=0
+while [ "${_tries}" -lt 30 ]; do
+  sleep 1
+  _F3_FP_B=$(tls_fingerprint "${F3_PORT}" "localhost")
+  if [ -n "${_F3_FP_B}" ] && [ "${_F3_FP_B}" != "${_F3_FP_A}" ]; then
+    break
+  fi
+  _tries=$((_tries + 1))
+done
+if [ -n "${_F3_FP_B}" ] && [ "${_F3_FP_B}" != "${_F3_FP_A}" ]; then
+  pass "F3: retry serves renewed cert B"
+else
+  fail "F3: retry did not serve cert B"
+fi
+_F3_SRC_B=$(src_fp_in_container "pgpooler-f3-renew-${SUFFIX}" "localhost")
+# The applied fingerprint is committed last by design (after the reload is
+# confirmed and state/UI are refreshed), so poll briefly for it to land.
+_F3_APPLIED_B=""
+_tries=0
+while [ "${_tries}" -lt 15 ]; do
+  _F3_APPLIED_B=$(read_applied_fp "pgpooler-f3-renew-${SUFFIX}")
+  if [ -n "${_F3_SRC_B}" ] && [ "${_F3_SRC_B}" = "${_F3_APPLIED_B}" ]; then
+    break
+  fi
+  sleep 1
+  _tries=$((_tries + 1))
+done
+if [ -n "${_F3_SRC_B}" ] && [ "${_F3_SRC_B}" = "${_F3_APPLIED_B}" ]; then
+  pass "F3: applied fingerprint becomes B only after success"
+else
+  fail "F3: applied fingerprint should equal source B after success"
+fi
+_F3_ID_AFTER=$(docker inspect "pgpooler-f3-renew-${SUFFIX}" --format '{{.Id}}' 2>/dev/null || printf '')
+if [ -n "${_F3_ID_BEFORE}" ] && [ "${_F3_ID_BEFORE}" = "${_F3_ID_AFTER}" ]; then
+  pass "F3: container did not restart across failure+retry"
+else
+  fail "F3: container must not restart"
+fi
+docker rm -f "pgpooler-f3-renew-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test F4: disabled with manual frontend TLS is rejected ---"
+for _f4c in "sslmode" "certonly" "keyonly" "full"; do
+  case "${_f4c}" in
+    sslmode)
+      _f4_extra="-e CLIENT_TLS_SSLMODE=require"
+      ;;
+    certonly)
+      _f4_extra="-e CLIENT_TLS_CERT_FILE=/tmp/manual.crt"
+      ;;
+    keyonly)
+      _f4_extra="-e CLIENT_TLS_KEY_FILE=/tmp/manual.key"
+      ;;
+    full)
+      _f4_extra="-e CLIENT_TLS_SSLMODE=require -e CLIENT_TLS_CERT_FILE=/tmp/manual.crt -e CLIENT_TLS_KEY_FILE=/tmp/manual.key"
+      ;;
+  esac
+  # shellcheck disable=SC2086
+  if docker run --rm --name "pgpooler-f4-${_f4c}-${SUFFIX}" \
+    -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+    -e PGPOOLER_SSL_MODE=disabled ${_f4_extra} \
+    --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-f4-${_f4c}-${SUFFIX}.log 2>&1; then
+    fail "F4 (${_f4c}): disabled+manual must fail startup"
+  else
+    if grep -qi "PGPOOLER_SSL_MODE=disabled" /tmp/pgpooler-f4-${_f4c}-${SUFFIX}.log 2>/dev/null; then
+      pass "F4 (${_f4c}): disabled+manual rejected clearly"
+    else
+      fail "F4 (${_f4c}): rejected without clear disabled error"
+    fi
+  fi
+done
+
+log "--- Test F5: manual TLS under prefer without PUBLIC_HOST ---"
+TLS_F5_DIR="${TLS_BASE}/f5"
+TLS_F5_TREE="${TLS_BASE}/f5-tree"
+F5_PORT=16447
+F5_UI=18047
+if make_test_cert "localhost" "${TLS_F5_DIR}"; then
+  mkdir -p "${TLS_F5_TREE}" 2>/dev/null || true
+  cp "${TLS_F5_DIR}/fullchain.pem" "${TLS_F5_TREE}/manual.crt" 2>/dev/null || true
+  cp "${TLS_F5_DIR}/privkey.pem" "${TLS_F5_TREE}/manual.key" 2>/dev/null || true
+  chmod 644 "${TLS_F5_TREE}/manual.crt" 2>/dev/null || true
+  chmod 600 "${TLS_F5_TREE}/manual.key" 2>/dev/null || true
+  pass "F5 manual cert staged"
+else
+  fail "F5 manual cert generation failed"
+fi
+docker run -d --name "pgpooler-f5-manual-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${F5_PORT}:6432" -p "127.0.0.1:${F5_UI}:8080" \
+  -v "${TLS_F5_TREE}:/manual-tls:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  -e CLIENT_TLS_SSLMODE=require -e CLIENT_TLS_CERT_FILE=/manual-tls/manual.crt -e CLIENT_TLS_KEY_FILE=/manual-tls/manual.key \
+  "${IMAGE}" >/dev/null
+sleep 5
+if tls_disable_connect "${F5_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  fail "F5: manual prefer must reject plaintext"
+else
+  pass "F5: manual prefer rejects plaintext"
+fi
+if tls_require_connect "${F5_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "F5: manual prefer accepts TLS"
+else
+  fail "F5: manual prefer TLS failed"
+fi
+if fetch_ui "${F5_UI}" "/tmp/pgpooler-f5-ui-${SUFFIX}.html"; then
+  if grep -q "Available and required (manual configuration)" "/tmp/pgpooler-f5-ui-${SUFFIX}.html" 2>/dev/null; then
+    pass "F5: UI reports manual require accurately"
+  else
+    fail "F5: UI should report manual require"
+  fi
+  if grep -q "sslmode=verify-full" "/tmp/pgpooler-f5-ui-${SUFFIX}.html" 2>/dev/null; then
+    pass "F5: UI recommends verify-full for manual require"
+  else
+    fail "F5: UI should recommend verify-full"
+  fi
+  rm -f "/tmp/pgpooler-f5-ui-${SUFFIX}.html" 2>/dev/null || true
+else
+  fail "F5: UI fetch failed"
+fi
+docker rm -f "pgpooler-f5-manual-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test F6: partial manual TLS identity is rejected ---"
+if docker run --rm --name "pgpooler-f6-certonly-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" \
+  -e PGPOOLER_SSL_MODE=prefer -e CLIENT_TLS_CERT_FILE=/tmp/manual.crt \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-f6-certonly-${SUFFIX}.log 2>&1; then
+  fail "F6: cert without key must fail"
+else
+  if grep -qi "CLIENT_TLS_KEY_FILE" /tmp/pgpooler-f6-certonly-${SUFFIX}.log 2>/dev/null; then
+    pass "F6: cert without key rejected clearly"
+  else
+    fail "F6: cert-without-key rejected without clear error"
+  fi
+fi
+if docker run --rm --name "pgpooler-f6-keyonly-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" \
+  -e PGPOOLER_SSL_MODE=prefer -e CLIENT_TLS_KEY_FILE=/tmp/manual.key \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-f6-keyonly-${SUFFIX}.log 2>&1; then
+  fail "F6: key without cert must fail"
+else
+  if grep -qi "CLIENT_TLS_CERT_FILE" /tmp/pgpooler-f6-keyonly-${SUFFIX}.log 2>/dev/null; then
+    pass "F6: key without cert rejected clearly"
+  else
+    fail "F6: key-without-cert rejected without clear error"
+  fi
+fi
+if docker run --rm --name "pgpooler-f6-requireonly-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" \
+  -e PGPOOLER_SSL_MODE=prefer -e CLIENT_TLS_SSLMODE=require \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-f6-requireonly-${SUFFIX}.log 2>&1; then
+  fail "F6: require without pair must fail"
+else
+  if grep -qi "needs both" /tmp/pgpooler-f6-requireonly-${SUFFIX}.log 2>/dev/null; then
+    pass "F6: require without pair rejected clearly"
+  else
+    fail "F6: require-without-pair rejected without clear error"
+  fi
+fi
+if docker run --rm --name "pgpooler-f6-badmode-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" \
+  -e PGPOOLER_SSL_MODE=prefer -e CLIENT_TLS_SSLMODE=bogus \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-f6-badmode-${SUFFIX}.log 2>&1; then
+  fail "F6: bogus sslmode must fail"
+else
+  if grep -qi "invalid CLIENT_TLS_SSLMODE" /tmp/pgpooler-f6-badmode-${SUFFIX}.log 2>/dev/null; then
+    pass "F6: bogus sslmode rejected clearly"
+  else
+    fail "F6: bogus sslmode rejected without clear error"
+  fi
+fi
+
 # Scrub TLS temp trees (may contain test keys; never committed).
 rm -rf "${TLS_BASE}" 2>/dev/null || true
 for _f in /tmp/pgpooler-uiwait-${SUFFIX}.tmp; do

@@ -272,9 +272,12 @@ PGPOOLER_SSL_MODE=disabled|prefer|required
 Default: `prefer`. This is a PgPooler-Uma policy setting and is NOT
 equivalent to PgBouncer native `client_tls_sslmode=prefer`.
 
-* `disabled`: never automatically enable frontend TLS. Certificate
-  presence is ignored for automatic purposes. Effective frontend
-  behavior is `client_tls_sslmode = disable`. No watcher is required.
+* `disabled`: frontend TLS is actually disabled. Automatic discovery is
+  off, and manual `CLIENT_TLS_CERT_FILE` / `CLIENT_TLS_KEY_FILE` /
+  `CLIENT_TLS_SSLMODE` settings are rejected with a clear configuration
+  error instead of silently running TLS while the UI reports Disabled.
+  Effective frontend behavior is always `client_tls_sslmode = disable`.
+  No watcher is required.
 
 * `prefer`: operate without TLS only while TLS is unavailable; once a
   valid certificate is available, require TLS. Without a certificate
@@ -317,10 +320,45 @@ fails fast with a clear error instead of silently mixing sources.
 `CLIENT_TLS_ECDHCURVE`, and `CLIENT_TLS_DHEPARAMS` may accompany
 automatic TLS as hardening extras. Without `PUBLIC_HOST`, default
 `prefer` stays plaintext unless manual `CLIENT_TLS_*` is provided, so
-upgrading the image does not break existing manual deployments. In
-`disabled` mode automatic discovery is off and manual settings pass
-through. In `required` mode without `PUBLIC_HOST`, manual TLS must
-already enforce `require` or stricter.
+upgrading the image does not break existing manual deployments. With
+`PGPOOLER_SSL_MODE=disabled`, any manual frontend TLS identity setting
+is rejected. In `required` mode without `PUBLIC_HOST`, manual TLS is
+accepted only when it actually enforces TLS (`CLIENT_TLS_SSLMODE` of
+`require` or stricter, plus a readable certificate/key pair).
+
+Manual identity validation fails fast on partial or contradictory
+combinations: certificate without key, key without certificate,
+`require` (or `verify-ca`/`verify-full`) without the pair, an unknown
+`CLIENT_TLS_SSLMODE` value, or unreadable cert/key files.
+
+Final policy matrix:
+
+```text
+disabled
+  automatic TLS: no
+  manual frontend TLS: rejected (startup error)
+  effective frontend TLS: off (client_tls_sslmode = disable)
+
+prefer + PUBLIC_HOST
+  automatic CapRover TLS (plaintext until a valid cert exists,
+  then native require; later appearance transitions without restart)
+
+prefer + no PUBLIC_HOST + valid CLIENT_TLS_* identity
+  manual TLS backward compatibility (no automatic discovery)
+
+prefer + neither
+  plaintext (client_tls_sslmode = disable)
+
+required + PUBLIC_HOST
+  automatic TLS, strictly fail-closed (waiting with UI only until a
+  valid cert is verified, installed, and confirmed in the config)
+
+required + no PUBLIC_HOST + valid manual CLIENT_TLS_* (require+)
+  manual required TLS
+
+required + neither
+  startup configuration error (no source from which TLS could appear)
+```
 
 ### Certificate validation
 
@@ -355,16 +393,50 @@ private runtime directory:
 Files are `0600` owned by `postgres`, the directory is `0700`, replacement
 is atomic (`tmp` plus `mv`), and PgBouncer never runs as root (dropped
 via `su-exec`). A polling watcher (default 300 seconds,
-`PGPOOLER_TLS_POLL_INTERVAL` override for tests and tuning) uses
-content fingerprints (`sha256sum`, following `live/* -> archive/*`
-symlinks) to detect initial appearance and renewal without container
-restarts, Certbot hooks, or inotify. On renewal the new pair is
-validated first, atomically installed, and PgBouncer is reloaded with
-`SIGHUP` (`RELOAD`); existing client connections stay alive per PgBouncer
-semantics and new TLS handshakes receive the renewed certificate.
-Changing TLS settings triggers an automatic server-side `RECONNECT`;
-verified live against PgBouncer 1.25.2 that `disable -> require` applies
-via `SIGHUP` with new plaintext rejected and no container restart.
+`PGPOOLER_TLS_POLL_INTERVAL` override for tests and tuning) compares the
+source content fingerprint (`sha256sum`, following `live/* -> archive/*`
+symlinks) against the last **applied** fingerprint to detect initial
+appearance and renewal without container restarts, Certbot hooks, or
+inotify.
+
+Applied means confirmed live, not merely copied: the applied fingerprint
+advances only after the full sequence succeeds (validate, install,
+rewrite config, verify the config literally carries
+`client_tls_sslmode = require` with the exact runtime cert/key paths,
+deliver `SIGHUP`, confirm the process survived). Any failure leaves the
+applied fingerprint unchanged so the next poll retries the same source
+version; state and UI are never published as `active` speculatively.
+On renewal the new pair is validated first, the previous known-good pair
+is backed up, files are atomically installed, and PgBouncer is reloaded
+with `SIGHUP` (`RELOAD`); a failed reload restores the previous files,
+keeps serving the old certificate, and retries later. Active TLS is
+never automatically downgraded to plaintext. Existing client connections
+stay alive per PgBouncer semantics and new TLS handshakes receive the
+renewed certificate. Changing TLS settings triggers an automatic
+server-side `RECONNECT`; verified live against PgBouncer 1.25.2 that
+`disable -> require` applies via `SIGHUP` with new plaintext rejected
+and no container restart.
+
+Required mode is strictly fail-closed: `waiting -> active` happens only
+after a valid source pair is installed, the rewritten config is verified
+to contain the require identity, and (for the late start) the parent
+re-verifies the config before starting PgBouncer and confirms the fresh
+process stays listening. Otherwise the PostgreSQL listener stays down,
+state remains `waiting` with `EXPECT_PGBOUNCER=0`, and the watcher
+retries. There is no code path that starts PgBouncer from a failed
+config rewrite merely because the config file exists.
+
+State invariants (also reflected by the UI and the healthcheck):
+
+```text
+plaintext: the running PgBouncer intentionally accepts plaintext.
+active:    the running PgBouncer has require plus a valid certificate
+           successfully applied; never set speculatively.
+waiting + EXPECT_PGBOUNCER=0: TLS is mandatory but not safely available;
+           no PgBouncer listener exists.
+disabled:  explicitly no frontend TLS (manual TLS rejected).
+manual/manual-require: native manual CLIENT_TLS_* behavior as configured.
+```
 
 ### Production example
 
@@ -421,16 +493,18 @@ plaintext PostgreSQL with `sslmode=disable` in examples.
 ### Manual TLS example (non-CapRover)
 
 ```env
-PGPOOLER_SSL_MODE=disabled
+PGPOOLER_SSL_MODE=prefer
 LISTEN_PORT=6432
 CLIENT_TLS_SSLMODE=require
 CLIENT_TLS_CERT_FILE=/certs/fullchain.pem
 CLIENT_TLS_KEY_FILE=/certs/privkey.pem
 ```
 
-Mount custom certificates read-only and manage renewal externally with a
-container restart or `SIGHUP`. Do not combine manual identity settings
-with `PUBLIC_HOST` automatic discovery.
+No `PUBLIC_HOST`, so no automatic discovery is attempted. Mount custom
+certificates read-only and manage renewal externally with a container
+restart or `SIGHUP`. Do not combine manual identity settings with
+`PUBLIC_HOST` automatic discovery. `PGPOOLER_SSL_MODE=disabled` cannot
+be combined with manual frontend TLS settings.
 
 ### Healthcheck
 
