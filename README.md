@@ -223,14 +223,20 @@ Required - waiting for certificate
 Preparing secure PostgreSQL endpoint
 ```
 
-When TLS is active the page recommends `sslmode=verify-full`. The
-`Preparing` and `Required - waiting` states show the future
-`verify-full` connection string only together with an explicit
-not-yet-available note, never as currently usable. When no certificate
-is active the page shows `sslmode=disable` and never misleads with
-`verify-full`. When `PUBLIC_HOST` is absent the page derives the display
-host from the browser request hostname (`window.location.hostname`);
-automatic certificate selection never guesses in that case.
+When TLS is active the page shows a directly usable `psql`/`libpq`
+connection string with `sslmode=verify-full&sslrootcert=system`:
+`sslmode=verify-full` performs certificate and hostname verification,
+and `sslrootcert=system` tells `psql`/`libpq` to verify against the
+operating system trusted CA store (so no `~/.postgresql/root.crt` file
+is needed). `sslrootcert=system` is a `libpq` option; other PostgreSQL
+drivers may use different CA/trust-store settings. The `Preparing` and
+`Required - waiting` states show the same future `libpq` string only
+together with an explicit not-yet-available note, never as currently
+usable. When no certificate is active the page shows `sslmode=disable`
+and never misleads with `verify-full`. When `PUBLIC_HOST` is absent the
+page derives the display host from the browser request hostname
+(`window.location.hostname`); automatic certificate selection never
+guesses in that case.
 
 ### CapRover deployment model
 
@@ -552,10 +558,11 @@ Container HTTP Port: 8080 (HTTPS via CapRover nginx)
 Public port mapping: 6432 -> 6432 (PostgreSQL/TLS direct to PgBouncer)
 ```
 
-Connection documentation (placeholders only):
+Connection documentation (placeholders only, `psql`/`libpq` form using
+the operating system trust store; other drivers may differ):
 
 ```text
-postgresql://<USERNAME>:<PASSWORD>@pgpooler.example.com:6432/crud?sslmode=verify-full
+postgresql://<USERNAME>:<PASSWORD>@pgpooler.example.com:6432/crud?sslmode=verify-full&sslrootcert=system
 ```
 
 ### Local example (no domain)
