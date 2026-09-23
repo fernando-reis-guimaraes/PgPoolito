@@ -977,6 +977,11 @@ if wait_ui "${P2_UI}"; then
     else
       pass "prefer no-cert UI does not mislead with verify-full"
     fi
+    if grep -q "sslrootcert" "/tmp/pgpooler-p2-ui-${SUFFIX}.html" 2>/dev/null; then
+      fail "prefer no-cert UI must not mention sslrootcert"
+    else
+      pass "prefer no-cert UI has no trust-store parameter"
+    fi
     rm -f "/tmp/pgpooler-p2-ui-${SUFFIX}.html" 2>/dev/null || true
   else
     fail "prefer no-cert UI fetch failed"
@@ -1044,6 +1049,28 @@ if wait_ui "${P3_UI}"; then
       pass "prefer with cert UI recommends verify-full"
     else
       fail "prefer with cert UI should recommend verify-full"
+    fi
+    if grep -F -q "sslmode=verify-full&amp;sslrootcert=system" "/tmp/pgpooler-p3-ui-${SUFFIX}.html" 2>/dev/null; then
+      pass "prefer with cert UI uses libpq OS trust-store form (escaped)"
+    else
+      fail "prefer with cert UI should use sslrootcert=system form"
+    fi
+    # The browser-visible (HTML-decoded) connection string must carry a
+    # literal `&` between the libpq parameters.
+    if sed -e 's/&amp;/\&/g' "/tmp/pgpooler-p3-ui-${SUFFIX}.html" 2>/dev/null | grep -F -q "?sslmode=verify-full&sslrootcert=system"; then
+      pass "prefer with cert UI shows usable libpq connection string"
+    else
+      fail "prefer with cert UI connection string must be directly usable"
+    fi
+    if grep -q "operating system trust store" "/tmp/pgpooler-p3-ui-${SUFFIX}.html" 2>/dev/null; then
+      pass "prefer with cert UI explains OS trust store"
+    else
+      fail "prefer with cert UI should explain OS trust store"
+    fi
+    if grep -F -q "${BACKEND_PASSWORD}" "/tmp/pgpooler-p3-ui-${SUFFIX}.html" 2>/dev/null || grep -F -q "${FRONTEND_PASSWORD}" "/tmp/pgpooler-p3-ui-${SUFFIX}.html" 2>/dev/null; then
+      fail "prefer with cert UI leaked a credential"
+    else
+      pass "prefer with cert UI contains no credentials"
     fi
     rm -f "/tmp/pgpooler-p3-ui-${SUFFIX}.html" 2>/dev/null || true
   else
@@ -1143,6 +1170,11 @@ if wait_ui "${P5_UI}"; then
       pass "required waiting: UI reports waiting state"
     else
       fail "required waiting UI should report waiting"
+    fi
+    if grep -F -q "sslmode=verify-full&amp;sslrootcert=system" "/tmp/pgpooler-p5-ui-${SUFFIX}.html" 2>/dev/null; then
+      pass "required waiting: UI future example uses libpq trust-store form"
+    else
+      fail "required waiting UI future example should use libpq form"
     fi
     rm -f "/tmp/pgpooler-p5-ui-${SUFFIX}.html" 2>/dev/null || true
   else

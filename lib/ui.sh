@@ -27,14 +27,21 @@ tls_display_string() {
   esac
 }
 
-# Connection sslmode hint for the displayed example.
-# verify-full is shown for waiting/prepared only as the future string for
-# an endpoint that is explicitly marked not yet available (see note below).
-ui_sslmode_for_state() {
+# Connection query parameters for the displayed example.
+# Automatic active TLS uses the psql/libpq operating-system trust-store
+# form so the copyable example works out of the box: the `&` below is
+# HTML-escaped to `&amp;` at render time, so the browser still shows and
+# copies a literal `&`. waiting/prepared show the same future libpq form
+# but explicitly marked not yet available (see note below). Plaintext
+# states stay on sslmode=disable with no trust-store parameter.
+# Manual modes keep their previous output: a manual certificate is not
+# necessarily publicly trusted, so no OS store is implied there.
+ui_conn_params_for_state() {
   case "$1" in
-    active|waiting|prepared|manual-require) printf 'verify-full' ;;
-    manual) printf '%s' "${2:-disable}" ;;
-    *) printf 'disable' ;;
+    active|waiting|prepared) printf 'sslmode=verify-full&sslrootcert=system' ;;
+    manual) printf 'sslmode=%s' "${2:-disable}" ;;
+    manual-require) printf 'sslmode=verify-full' ;;
+    *) printf 'sslmode=disable' ;;
   esac
 }
 
@@ -64,8 +71,8 @@ generate_ui_page() {
       _u_manual_sslmode="${CLIENT_TLS_SSLMODE}"
       ;;
   esac
-  _u_sslmode=$(ui_sslmode_for_state "${_u_state}" "${_u_manual_sslmode}")
-  _u_sslmode_esc=$(html_escape "${_u_sslmode}")
+  _u_conn_params=$(ui_conn_params_for_state "${_u_state}" "${_u_manual_sslmode}")
+  _u_conn_params_esc=$(html_escape "${_u_conn_params}")
 
   # Host block: static when PUBLIC_HOST is set, dynamic via browser
   # hostname otherwise (no certificate guessing involved).
@@ -79,18 +86,21 @@ generate_ui_page() {
     _u_js="<script>(function(){try{var h=window.location.hostname||'localhost';var els=document.querySelectorAll('[data-dynamic-host]');for(var i=0;i<els.length;i++){els[i].textContent=h;}var c=document.getElementById('connstr');if(c){var t=c.textContent||'';c.textContent=t.split('this host').join(h);}}catch(e){}})();</script>"
   fi
 
-  # TLS note: recommend verify-full only when TLS is active/required.
-  # waiting/prepared show the future string but explicitly mark the
+  # TLS note: the active note documents the psql/libpq OS trust-store
+  # form; waiting/prepared show the future string but explicitly mark the
   # endpoint as not yet available so it is never presented as usable.
   case "${_u_state}" in
-    active|manual-require)
+    active)
+      _u_tls_note="<p class=\"note\">For psql/libpq, use sslmode=verify-full with sslrootcert=system to verify the certificate and hostname using the operating system trust store. Other PostgreSQL drivers may use different CA/trust-store settings.</p>"
+      ;;
+    manual-require)
       _u_tls_note="<p class=\"note\">Use hostname verification on the client, for example <code>sslmode=verify-full</code>.</p>"
       ;;
     prepared)
-      _u_tls_note="<p class=\"note\">The secure PostgreSQL endpoint is being prepared and is not yet available. Once ready, use hostname verification, for example <code>sslmode=verify-full</code>.</p>"
+      _u_tls_note="<p class=\"note\">The secure PostgreSQL endpoint is being prepared and is not yet available. Once ready, for psql/libpq use sslmode=verify-full with sslrootcert=system to verify using the operating system trust store.</p>"
       ;;
     waiting)
-      _u_tls_note="<p class=\"note\">The secure PostgreSQL endpoint is not yet available; waiting for a certificate. Once ready, use hostname verification, for example <code>sslmode=verify-full</code>.</p>"
+      _u_tls_note="<p class=\"note\">The secure PostgreSQL endpoint is not yet available; waiting for a certificate. Once ready, for psql/libpq use sslmode=verify-full with sslrootcert=system to verify using the operating system trust store.</p>"
       ;;
     *)
       _u_tls_note="<p class=\"note\">TLS is not currently active for PostgreSQL connections. The example below uses <code>sslmode=disable</code>.</p>"
@@ -135,7 +145,7 @@ a{color:#7dd3fc}
 <div><p class="v">${_u_display_esc}</p></div>
 </div>
 <p class="k">Connection string</p>
-<code class="conn" id="connstr">postgresql://&lt;USERNAME&gt;:&lt;PASSWORD&gt;@${_u_conn_host_esc}:${_u_port_esc}/${_u_db_esc}?sslmode=${_u_sslmode_esc}</code>
+<code class="conn" id="connstr">postgresql://&lt;USERNAME&gt;:&lt;PASSWORD&gt;@${_u_conn_host_esc}:${_u_port_esc}/${_u_db_esc}?${_u_conn_params_esc}</code>
 ${_u_tls_note}
 <p class="note">PostgreSQL protocol on port ${_u_port_esc}. Documentation UI on port 8080. No login is required for this page and it never asks for credentials.</p>
 </div>
