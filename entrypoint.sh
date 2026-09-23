@@ -10,6 +10,174 @@ PG_CONFIG_DIR=/etc/pgbouncer
 PG_CONFIG_FILE="${PG_CONFIG_DIR}/pgbouncer.ini"
 _AUTH_FILE="${AUTH_FILE:-$PG_CONFIG_DIR/userlist.txt}"
 
+# Load PgPooler-Uma TLS + UI helpers when present (container path first,
+# then relative to this script for local execution). Never fail when the
+# helpers are absent in minimal test harnesses.
+if [ -f "/usr/local/lib/pgpooler/tls.sh" ]; then
+  # shellcheck source=/dev/null
+  . "/usr/local/lib/pgpooler/tls.sh"
+elif [ -f "$(dirname -- "$0")/lib/tls.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$(dirname -- "$0")/lib/tls.sh"
+elif [ -f "./lib/tls.sh" ]; then
+  # shellcheck source=/dev/null
+  . "./lib/tls.sh"
+fi
+if [ -f "/usr/local/lib/pgpooler/ui.sh" ]; then
+  # shellcheck source=/dev/null
+  . "/usr/local/lib/pgpooler/ui.sh"
+elif [ -f "$(dirname -- "$0")/lib/ui.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$(dirname -- "$0")/lib/ui.sh"
+elif [ -f "./lib/ui.sh" ]; then
+  # shellcheck source=/dev/null
+  . "./lib/ui.sh"
+fi
+
+# PgPooler-Uma frontend TLS policy (CapRover-friendly).
+# PGPOOLER_SSL_MODE controls automatic CapRover certificate discovery.
+# It is NOT PgBouncer native client_tls_sslmode. Our prefer means:
+# plaintext only while no valid certificate exists, require once one does.
+# Both prefer (with cert) and required (with cert) map to native require.
+PGPOOLER_SSL_MODE="${PGPOOLER_SSL_MODE:-prefer}"
+case "${PGPOOLER_SSL_MODE}" in
+  disabled|prefer|required) ;;
+  *)
+    echo "error: invalid PGPOOLER_SSL_MODE='${PGPOOLER_SSL_MODE}' (expected disabled|prefer|required)." >&2
+    exit 1
+    ;;
+esac
+
+# PUBLIC_HOST is the single canonical explicit hostname. Untrusted input:
+# sanitize before any filesystem or OpenSSL use. No eval anywhere.
+PUBLIC_HOST_SANITIZED=""
+if [ -n "${PUBLIC_HOST:-}" ]; then
+  if command -v sanitize_public_host >/dev/null 2>&1; then
+    if PUBLIC_HOST_SANITIZED=$(sanitize_public_host "${PUBLIC_HOST}" 2>/dev/null); then
+      :
+    else
+      echo "error: invalid PUBLIC_HOST value (must be a single DNS hostname)." >&2
+      exit 1
+    fi
+  else
+    # Fallback minimal guard when helper lib is unavailable.
+    case "${PUBLIC_HOST}" in
+      *[!A-Za-z0-9.-]*)
+        echo "error: invalid PUBLIC_HOST value (must be a single DNS hostname)." >&2
+        exit 1
+        ;;
+      .*)
+        echo "error: invalid PUBLIC_HOST value (must be a single DNS hostname)." >&2
+        exit 1
+        ;;
+      *.)
+        echo "error: invalid PUBLIC_HOST value (must be a single DNS hostname)." >&2
+        exit 1
+        ;;
+      -*)
+        echo "error: invalid PUBLIC_HOST value (must be a single DNS hostname)." >&2
+        exit 1
+        ;;
+      *-)
+        echo "error: invalid PUBLIC_HOST value (must be a single DNS hostname)." >&2
+        exit 1
+        ;;
+      *..*)
+        echo "error: invalid PUBLIC_HOST value (must be a single DNS hostname)." >&2
+        exit 1
+        ;;
+      *)
+        PUBLIC_HOST_SANITIZED="${PUBLIC_HOST}"
+        ;;
+    esac
+  fi
+fi
+
+# Manual frontend TLS identity (advanced / non-CapRover users).
+# Only CERT_FILE / KEY_FILE / SSLMODE count; CA/protocols/ciphers alone
+# do not trigger manual mode and may accompany automatic TLS.
+MANUAL_FRONTEND_TLS=0
+if [ -n "${CLIENT_TLS_CERT_FILE:-}" ] || [ -n "${CLIENT_TLS_KEY_FILE:-}" ] || [ -n "${CLIENT_TLS_SSLMODE:-}" ]; then
+  MANUAL_FRONTEND_TLS=1
+fi
+
+# Automatic CapRover discovery is a candidate only when a hostname is
+# configured and the policy is not disabled. Without PUBLIC_HOST we never
+# scan certificate directories (a server may hold dozens of certs).
+AUTO_TLS_CANDIDATE=0
+if [ "${PGPOOLER_SSL_MODE}" != "disabled" ] && [ -n "${PUBLIC_HOST_SANITIZED}" ]; then
+  AUTO_TLS_CANDIDATE=1
+fi
+
+# Deterministic precedence: never silently mix automatic discovery with a
+# manually specified certificate/key pair. Fail clearly instead of guessing.
+if [ "${AUTO_TLS_CANDIDATE}" = "1" ] && [ "${MANUAL_FRONTEND_TLS}" = "1" ]; then
+  echo "error: conflicting frontend TLS configuration: PUBLIC_HOST automatic TLS (PGPOOLER_SSL_MODE=${PGPOOLER_SSL_MODE}) cannot be combined with manual CLIENT_TLS_CERT_FILE/CLIENT_TLS_KEY_FILE/CLIENT_TLS_SSLMODE. Unset the manual settings for automatic CapRover TLS, or set PGPOOLER_SSL_MODE=disabled to use manual TLS only." >&2
+  exit 1
+fi
+
+# required without any TLS source can never succeed: fail fast instead of
+# waiting forever with nothing to watch.
+if [ "${PGPOOLER_SSL_MODE}" = "required" ] && [ "${AUTO_TLS_CANDIDATE}" = "0" ] && [ "${MANUAL_FRONTEND_TLS}" = "0" ]; then
+  echo "error: PGPOOLER_SSL_MODE=required needs either PUBLIC_HOST (automatic CapRover certificate) or manual CLIENT_TLS_* configuration. No TLS source is configured." >&2
+  exit 1
+fi
+
+# required with manual TLS (no automatic candidate) must actually enforce
+# TLS: the manual sslmode must be require or stricter.
+if [ "${PGPOOLER_SSL_MODE}" = "required" ] && [ "${AUTO_TLS_CANDIDATE}" = "0" ] && [ "${MANUAL_FRONTEND_TLS}" = "1" ]; then
+  case "${CLIENT_TLS_SSLMODE:-}" in
+    require|verify-ca|verify-full) ;;
+    *)
+      echo "error: PGPOOLER_SSL_MODE=required with manual TLS needs CLIENT_TLS_SSLMODE=require (or verify-ca/verify-full). Current value does not enforce TLS." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# Watcher polling interval (seconds). Default 300 per spec; override is
+# honored for tests/advanced tuning. No busy loop: minimum 5 seconds.
+PGPOOLER_TLS_POLL_INTERVAL="${PGPOOLER_TLS_POLL_INTERVAL:-300}"
+case "${PGPOOLER_TLS_POLL_INTERVAL}" in
+  ''|*[!0-9]*)
+    echo "error: invalid PGPOOLER_TLS_POLL_INTERVAL='${PGPOOLER_TLS_POLL_INTERVAL}' (expected integer seconds)." >&2
+    exit 1
+    ;;
+esac
+if [ "${PGPOOLER_TLS_POLL_INTERVAL}" -lt 5 ]; then
+  PGPOOLER_TLS_POLL_INTERVAL=5
+fi
+if [ "${PGPOOLER_TLS_POLL_INTERVAL}" -gt 3600 ]; then
+  PGPOOLER_TLS_POLL_INTERVAL=3600
+fi
+
+# Runtime TLS locations (mirror lib/tls.sh defaults when lib is missing).
+if [ -z "${TLS_RUNTIME_DIR:-}" ]; then
+  TLS_RUNTIME_DIR="/run/pgbouncer/tls"
+fi
+if [ -z "${TLS_RUNTIME_CERT:-}" ]; then
+  TLS_RUNTIME_CERT="${TLS_RUNTIME_DIR}/fullchain.pem"
+fi
+if [ -z "${TLS_RUNTIME_KEY:-}" ]; then
+  TLS_RUNTIME_KEY="${TLS_RUNTIME_DIR}/privkey.pem"
+fi
+if [ -z "${PGPOOLER_STATE_FILE:-}" ]; then
+  PGPOOLER_STATE_FILE="/run/pgbouncer/pgpooler.state"
+fi
+if [ -z "${CAPROVER_BASE:-}" ]; then
+  CAPROVER_BASE="/caprover-letsencrypt"
+fi
+HTTP_PORT="8080"
+WWW_DIR="/var/www"
+WWW_FILE="${WWW_DIR}/index.html"
+PGBOUNCER_PID_FILE="/run/pgbouncer/pgbouncer.pid"
+
+# Frontend TLS runtime state. One of: disabled, plaintext, active,
+# waiting, manual, manual-require. Also controls UI + healthcheck.
+FRONTEND_TLS_STATE="plaintext"
+FRONTEND_TLS_ACTIVE=0
+EXPECT_PGBOUNCER=1
+
 # Workaround userlist.txt missing issue
 # https://github.com/edoburu/docker-pgbouncer/issues/33
 if [ ! -e "${_AUTH_FILE}" ]; then
@@ -17,6 +185,9 @@ if [ ! -e "${_AUTH_FILE}" ]; then
 fi
 # Restrict auth file permissions (contains credentials).
 chmod 0600 "${_AUTH_FILE}" 2>/dev/null || true
+if [ "$(id -u 2>/dev/null || printf '0')" = "0" ] && id postgres >/dev/null 2>&1; then
+  chown postgres:postgres "${_AUTH_FILE}" 2>/dev/null || true
+fi
 
 # PgPooler-Uma extension: optional independent frontend credentials.
 # PGBOUNCER_USER / PGBOUNCER_PASSWORD authenticate applications connecting
@@ -180,6 +351,9 @@ write_user_entry() {
     touch "${_AUTH_FILE}"
   fi
   chmod 0600 "${_AUTH_FILE}" 2>/dev/null || true
+  if [ "$(id -u 2>/dev/null || printf '0')" = "0" ] && id postgres >/dev/null 2>&1; then
+    chown postgres:postgres "${_AUTH_FILE}" 2>/dev/null || true
+  fi
   if authfile_has_user "${_w_user}"; then
     return 0
   fi
@@ -252,6 +426,161 @@ print_config_redacted() {
   fi
 }
 
+# --- Frontend TLS config helpers (automatic CapRover behavior) ---
+
+# Append the initial frontend TLS block during config generation.
+# Automatic active -> require + runtime paths. Manual -> preserved native
+# CLIENT_TLS_* lines. Otherwise explicit disable (equivalent to default).
+write_frontend_tls_block() {
+  if [ "${FRONTEND_TLS_ACTIVE}" = "1" ]; then
+    printf 'client_tls_sslmode = require\n' >> "${PG_CONFIG_FILE}"
+    printf 'client_tls_cert_file = %s\n' "${TLS_RUNTIME_CERT}" >> "${PG_CONFIG_FILE}"
+    printf 'client_tls_key_file = %s\n' "${TLS_RUNTIME_KEY}" >> "${PG_CONFIG_FILE}"
+    # Optional hardening extras may accompany automatic TLS.
+    if [ -n "${CLIENT_TLS_CA_FILE:-}" ]; then
+      printf 'client_tls_ca_file = %s\n' "${CLIENT_TLS_CA_FILE}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_PROTOCOLS:-}" ]; then
+      printf 'client_tls_protocols = %s\n' "${CLIENT_TLS_PROTOCOLS}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_CIPHERS:-}" ]; then
+      printf 'client_tls_ciphers = %s\n' "${CLIENT_TLS_CIPHERS}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_ECDHCURVE:-}" ]; then
+      printf 'client_tls_ecdhcurve = %s\n' "${CLIENT_TLS_ECDHCURVE}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_DHEPARAMS:-}" ]; then
+      printf 'client_tls_dheparams = %s\n' "${CLIENT_TLS_DHEPARAMS}" >> "${PG_CONFIG_FILE}"
+    fi
+    return 0
+  fi
+  if [ "${MANUAL_FRONTEND_TLS}" = "1" ]; then
+    if [ -n "${CLIENT_TLS_SSLMODE:-}" ]; then
+      printf 'client_tls_sslmode = %s\n' "${CLIENT_TLS_SSLMODE}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_KEY_FILE:-}" ]; then
+      printf 'client_tls_key_file = %s\n' "${CLIENT_TLS_KEY_FILE}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_CERT_FILE:-}" ]; then
+      printf 'client_tls_cert_file = %s\n' "${CLIENT_TLS_CERT_FILE}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_CA_FILE:-}" ]; then
+      printf 'client_tls_ca_file = %s\n' "${CLIENT_TLS_CA_FILE}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_PROTOCOLS:-}" ]; then
+      printf 'client_tls_protocols = %s\n' "${CLIENT_TLS_PROTOCOLS}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_CIPHERS:-}" ]; then
+      printf 'client_tls_ciphers = %s\n' "${CLIENT_TLS_CIPHERS}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_ECDHCURVE:-}" ]; then
+      printf 'client_tls_ecdhcurve = %s\n' "${CLIENT_TLS_ECDHCURVE}" >> "${PG_CONFIG_FILE}"
+    fi
+    if [ -n "${CLIENT_TLS_DHEPARAMS:-}" ]; then
+      printf 'client_tls_dheparams = %s\n' "${CLIENT_TLS_DHEPARAMS}" >> "${PG_CONFIG_FILE}"
+    fi
+    return 0
+  fi
+  # No TLS: explicit disable so plaintext behavior is intentional.
+  printf 'client_tls_sslmode = disable\n' >> "${PG_CONFIG_FILE}"
+}
+
+# Rewrite an existing generated config to require automatic TLS.
+# Used by the watcher for the prefer plaintext->TLS transition.
+# Removes prior client_tls_sslmode/cert/key lines, appends require block.
+# Atomic via temp file + mv. Preserves all other settings.
+update_config_tls_to_require() {
+  _u_tmp="${PG_CONFIG_FILE}.tls.tmp.$$"
+  rm -f "${_u_tmp}" 2>/dev/null || true
+  # Strip prior frontend identity lines (sslmode/cert/key only; keep
+  # CA/protocols/ciphers extras which are re-appended from env below).
+  grep -v -E '^[[:space:]]*client_tls_(sslmode|cert_file|key_file)[[:space:]]*=' "${PG_CONFIG_FILE}" > "${_u_tmp}" 2>/dev/null || return 1
+  {
+    printf 'client_tls_sslmode = require\n'
+    printf 'client_tls_cert_file = %s\n' "${TLS_RUNTIME_CERT}"
+    printf 'client_tls_key_file = %s\n' "${TLS_RUNTIME_KEY}"
+    if [ -n "${CLIENT_TLS_CA_FILE:-}" ]; then
+      # Avoid duplicating an existing ca line already preserved above.
+      if ! grep -q -E '^[[:space:]]*client_tls_ca_file[[:space:]]*=' "${_u_tmp}" 2>/dev/null; then
+        printf 'client_tls_ca_file = %s\n' "${CLIENT_TLS_CA_FILE}"
+      fi
+    fi
+    if [ -n "${CLIENT_TLS_PROTOCOLS:-}" ]; then
+      if ! grep -q -E '^[[:space:]]*client_tls_protocols[[:space:]]*=' "${_u_tmp}" 2>/dev/null; then
+        printf 'client_tls_protocols = %s\n' "${CLIENT_TLS_PROTOCOLS}"
+      fi
+    fi
+    if [ -n "${CLIENT_TLS_CIPHERS:-}" ]; then
+      if ! grep -q -E '^[[:space:]]*client_tls_ciphers[[:space:]]*=' "${_u_tmp}" 2>/dev/null; then
+        printf 'client_tls_ciphers = %s\n' "${CLIENT_TLS_CIPHERS}"
+      fi
+    fi
+    if [ -n "${CLIENT_TLS_ECDHCURVE:-}" ]; then
+      if ! grep -q -E '^[[:space:]]*client_tls_ecdhcurve[[:space:]]*=' "${_u_tmp}" 2>/dev/null; then
+        printf 'client_tls_ecdhcurve = %s\n' "${CLIENT_TLS_ECDHCURVE}"
+      fi
+    fi
+    if [ -n "${CLIENT_TLS_DHEPARAMS:-}" ]; then
+      if ! grep -q -E '^[[:space:]]*client_tls_dheparams[[:space:]]*=' "${_u_tmp}" 2>/dev/null; then
+        printf 'client_tls_dheparams = %s\n' "${CLIENT_TLS_DHEPARAMS}"
+      fi
+    fi
+  } >> "${_u_tmp}" || return 1
+  chmod 0600 "${_u_tmp}" 2>/dev/null || true
+  if [ "$(id -u 2>/dev/null || printf '0')" = "0" ] && id postgres >/dev/null 2>&1; then
+    chown postgres:postgres "${_u_tmp}" 2>/dev/null || true
+  fi
+  mv -f "${_u_tmp}" "${PG_CONFIG_FILE}" 2>/dev/null || return 1
+  chmod 0600 "${PG_CONFIG_FILE}" 2>/dev/null || true
+  return 0
+}
+
+# Persist supervisor state for the healthcheck and UI.
+write_state_file() {
+  mkdir -p "$(dirname "${PGPOOLER_STATE_FILE}")" 2>/dev/null || true
+  {
+    printf 'TLS_STATE=%s\n' "${FRONTEND_TLS_STATE}"
+    if [ "${EXPECT_PGBOUNCER}" = "0" ]; then
+      printf 'EXPECT_PGBOUNCER=0\n'
+    else
+      printf 'EXPECT_PGBOUNCER=1\n'
+    fi
+  } > "${PGPOOLER_STATE_FILE}.tmp" 2>/dev/null || return 1
+  mv -f "${PGPOOLER_STATE_FILE}.tmp" "${PGPOOLER_STATE_FILE}" 2>/dev/null || return 1
+  chmod 0644 "${PGPOOLER_STATE_FILE}" 2>/dev/null || true
+  return 0
+}
+
+# Resolve the database name for UI display without mutating global DB_*.
+# Prefers explicit DB_NAME, then first DATABASE_URL(S) entry, else "*".
+resolve_display_db() {
+  # Capture explicit env before parsing overwrote it is handled by caller
+  # via _ORIG_DB_NAME; fall back to current DB_NAME.
+  if [ -n "${_ORIG_DB_NAME:-}" ]; then
+    printf '%s' "${_ORIG_DB_NAME}"
+    return 0
+  fi
+  if [ -n "${DB_NAME:-}" ]; then
+    printf '%s' "${DB_NAME}"
+    return 0
+  fi
+  printf '*'
+}
+
+# Render the documentation UI for the current FRONTEND_TLS_STATE.
+render_ui() {
+  _r_port="${LISTEN_PORT:-5432}"
+  _r_db=$(resolve_display_db)
+  if command -v generate_ui_page >/dev/null 2>&1; then
+    generate_ui_page "${FRONTEND_TLS_STATE}" "${PUBLIC_HOST_SANITIZED}" "${_r_port}" "${_r_db}" "${WWW_FILE}" || true
+  fi
+  # UI files contain no secrets: world-readable is safe.
+  chmod 0644 "${WWW_FILE}" 2>/dev/null || true
+}
+
+# Remember explicit DB_NAME before URL parsing overwrites it.
+_ORIG_DB_NAME="${DB_NAME:-}"
+
 # Write the password with MD5 encryption, to avoid printing it during startup.
 # Notice that `docker inspect` will show unencrypted env variables.
 # NOTE: comma-separated iteration runs in the main shell (no pipe subshell)
@@ -279,6 +608,97 @@ else
   fi
   generate_userlist_if_needed
   ensure_frontend_auth
+fi
+
+# Detect a pre-existing custom config before we generate one.
+_CUSTOM_CONFIG=0
+if [ -f "${PG_CONFIG_FILE}" ]; then
+  _CUSTOM_CONFIG=1
+fi
+if [ "${_CUSTOM_CONFIG}" = "1" ] && [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
+  echo "error: automatic CapRover TLS (PUBLIC_HOST=${PUBLIC_HOST_SANITIZED}) requires the generated pgbouncer.ini; a custom mounted config is present. Remove the custom mount to use automatic TLS, or set PGPOOLER_SSL_MODE=disabled with manual CLIENT_TLS_* settings." >&2
+  exit 1
+fi
+
+# Initial automatic TLS bootstrap (privileged: reads read-only source tree,
+# validates with OpenSSL, installs private runtime copies). No secrets logged.
+if [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
+  _SRC_CERT="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/fullchain.pem"
+  _SRC_KEY="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/privkey.pem"
+  if command -v validate_caprover_cert >/dev/null 2>&1; then
+    if validate_caprover_cert "${_SRC_CERT}" "${_SRC_KEY}" "${PUBLIC_HOST_SANITIZED}"; then
+      if install_runtime_cert "${_SRC_CERT}" "${_SRC_KEY}"; then
+        FRONTEND_TLS_ACTIVE=1
+        FRONTEND_TLS_STATE="active"
+        echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; frontend TLS is now required" >&2
+      else
+        echo "TLS setup: failed to install runtime certificate for ${PUBLIC_HOST_SANITIZED}." >&2
+        if [ "${PGPOOLER_SSL_MODE}" = "required" ]; then
+          FRONTEND_TLS_ACTIVE=0
+          FRONTEND_TLS_STATE="waiting"
+        else
+          FRONTEND_TLS_ACTIVE=0
+          FRONTEND_TLS_STATE="plaintext"
+        fi
+      fi
+    else
+      if [ "${PGPOOLER_SSL_MODE}" = "required" ]; then
+        FRONTEND_TLS_ACTIVE=0
+        FRONTEND_TLS_STATE="waiting"
+        echo "Frontend TLS policy requires a certificate; waiting before starting PgBouncer" >&2
+      else
+        FRONTEND_TLS_ACTIVE=0
+        FRONTEND_TLS_STATE="plaintext"
+        echo "Frontend TLS policy: prefer" >&2
+        echo "No valid certificate for ${PUBLIC_HOST_SANITIZED}; starting PgBouncer without frontend TLS" >&2
+      fi
+    fi
+  else
+    # Helper lib missing: cannot validate safely.
+    if [ "${PGPOOLER_SSL_MODE}" = "required" ]; then
+      FRONTEND_TLS_ACTIVE=0
+      FRONTEND_TLS_STATE="waiting"
+      echo "Frontend TLS policy requires a certificate; waiting before starting PgBouncer" >&2
+    else
+      FRONTEND_TLS_ACTIVE=0
+      FRONTEND_TLS_STATE="plaintext"
+      echo "Frontend TLS policy: prefer" >&2
+      echo "No valid certificate for ${PUBLIC_HOST_SANITIZED}; starting PgBouncer without frontend TLS" >&2
+    fi
+  fi
+else
+  # No automatic candidate: disabled, manual, or plaintext default.
+  if [ "${PGPOOLER_SSL_MODE}" = "disabled" ]; then
+    FRONTEND_TLS_ACTIVE=0
+    FRONTEND_TLS_STATE="disabled"
+    echo "Frontend TLS policy: disabled" >&2
+  elif [ "${MANUAL_FRONTEND_TLS}" = "1" ]; then
+    FRONTEND_TLS_ACTIVE=0
+    case "${CLIENT_TLS_SSLMODE:-}" in
+      require|verify-ca|verify-full)
+        FRONTEND_TLS_STATE="manual-require"
+        ;;
+      *)
+        FRONTEND_TLS_STATE="manual"
+        ;;
+    esac
+    echo "Frontend TLS: manual configuration in use" >&2
+  else
+    FRONTEND_TLS_ACTIVE=0
+    FRONTEND_TLS_STATE="plaintext"
+    if [ -n "${PUBLIC_HOST_SANITIZED}" ]; then
+      echo "Frontend TLS policy: prefer" >&2
+      echo "No valid certificate for ${PUBLIC_HOST_SANITIZED}; starting PgBouncer without frontend TLS" >&2
+    else
+      echo "Frontend TLS policy: prefer (no PUBLIC_HOST; automatic TLS inactive)" >&2
+    fi
+  fi
+fi
+
+if [ "${FRONTEND_TLS_STATE}" = "waiting" ]; then
+  EXPECT_PGBOUNCER=0
+else
+  EXPECT_PGBOUNCER=1
 fi
 
 if [ ! -f "${PG_CONFIG_FILE}" ]; then
@@ -367,14 +787,10 @@ ${DNS_MAX_TTL:+dns_max_ttl = ${DNS_MAX_TTL}\n}\
 ${DNS_NXDOMAIN_TTL:+dns_nxdomain_ttl = ${DNS_NXDOMAIN_TTL}\n}\
 
 # TLS settings
-${CLIENT_TLS_SSLMODE:+client_tls_sslmode = ${CLIENT_TLS_SSLMODE}\n}\
-${CLIENT_TLS_KEY_FILE:+client_tls_key_file = ${CLIENT_TLS_KEY_FILE}\n}\
-${CLIENT_TLS_CERT_FILE:+client_tls_cert_file = ${CLIENT_TLS_CERT_FILE}\n}\
-${CLIENT_TLS_CA_FILE:+client_tls_ca_file = ${CLIENT_TLS_CA_FILE}\n}\
-${CLIENT_TLS_PROTOCOLS:+client_tls_protocols = ${CLIENT_TLS_PROTOCOLS}\n}\
-${CLIENT_TLS_CIPHERS:+client_tls_ciphers = ${CLIENT_TLS_CIPHERS}\n}\
-${CLIENT_TLS_ECDHCURVE:+client_tls_ecdhcurve = ${CLIENT_TLS_ECDHCURVE}\n}\
-${CLIENT_TLS_DHEPARAMS:+client_tls_dheparams = ${CLIENT_TLS_DHEPARAMS}\n}\
+" >> "${PG_CONFIG_FILE}"
+  # Frontend TLS block: automatic require, manual passthrough, or disable.
+  write_frontend_tls_block
+  printf "\
 ${SERVER_TLS_SSLMODE:+server_tls_sslmode = ${SERVER_TLS_SSLMODE}\n}\
 ${SERVER_TLS_CA_FILE:+server_tls_ca_file = ${SERVER_TLS_CA_FILE}\n}\
 ${SERVER_TLS_KEY_FILE:+server_tls_key_file = ${SERVER_TLS_KEY_FILE}\n}\
@@ -401,12 +817,371 @@ ${TCP_USER_TIMEOUT:+tcp_user_timeout = ${TCP_USER_TIMEOUT}\n}\
 ################## end file ##################
 " >> "${PG_CONFIG_FILE}"
   chmod 0600 "${PG_CONFIG_FILE}" 2>/dev/null || true
+  if [ "$(id -u 2>/dev/null || printf '0')" = "0" ] && id postgres >/dev/null 2>&1; then
+    chown postgres:postgres "${PG_CONFIG_FILE}" 2>/dev/null || true
+  fi
   print_config_redacted
 fi
 
 # Ensure restrictive permissions on generated files (may already exist).
 chmod 0600 "${PG_CONFIG_FILE}" 2>/dev/null || true
 chmod 0600 "${_AUTH_FILE}" 2>/dev/null || true
+if [ "$(id -u 2>/dev/null || printf '0')" = "0" ] && id postgres >/dev/null 2>&1; then
+  chown postgres:postgres "${PG_CONFIG_FILE}" "${_AUTH_FILE}" 2>/dev/null || true
+fi
+if [ -f "${TLS_RUNTIME_CERT}" ]; then
+  chmod 0600 "${TLS_RUNTIME_CERT}" 2>/dev/null || true
+fi
+if [ -f "${TLS_RUNTIME_KEY}" ]; then
+  chmod 0600 "${TLS_RUNTIME_KEY}" 2>/dev/null || true
+fi
 
-echo "Starting $*..."
-exec "$@"
+# Publish supervisor state + documentation UI before process startup.
+write_state_file || true
+mkdir -p "${WWW_DIR}" 2>/dev/null || true
+render_ui || true
+if [ "$(id -u 2>/dev/null || printf '0')" = "0" ] && id postgres >/dev/null 2>&1; then
+  chown -R postgres:postgres "${WWW_DIR}" 2>/dev/null || true
+  if [ -d "${TLS_RUNTIME_DIR}" ]; then
+    chown -R postgres:postgres "${TLS_RUNTIME_DIR}" 2>/dev/null || true
+    chmod 0700 "${TLS_RUNTIME_DIR}" 2>/dev/null || true
+    chmod 0600 "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null || true
+  fi
+fi
+
+# Compatibility path: config/auth inspection commands (used by tests and
+# custom tooling) keep the historical generate-then-exec behavior without
+# starting the HTTP UI, PgBouncer supervisor, or certificate watcher.
+# The normal container CMD starts /usr/bin/pgbouncer.
+_IS_PGBOUNCER_CMD=0
+case "${1:-}" in
+  *pgbouncer*) _IS_PGBOUNCER_CMD=1 ;;
+esac
+if [ "${_IS_PGBOUNCER_CMD}" = "0" ]; then
+  echo "Starting $*..."
+  exec "$@"
+fi
+
+# --- Supervised runtime (PID 1): HTTP UI + PgBouncer + cert watcher ---
+# PgBouncer itself always runs unprivileged as postgres via su-exec.
+# The privileged parent only handles cert install, config updates, UI
+# refresh, watcher polling, and signal forwarding. No eval, no secrets.
+
+HTTPD_PID=""
+PGBOUNCER_PID=""
+WATCHER_PID=""
+_SHUTDOWN=0
+
+cleanup_children() {
+  _sig="${1:-TERM}"
+  if [ -n "${WATCHER_PID}" ]; then
+    kill "${_sig}" "${WATCHER_PID}" 2>/dev/null || true
+  fi
+  if [ -n "${PGBOUNCER_PID}" ]; then
+    kill "${_sig}" "${PGBOUNCER_PID}" 2>/dev/null || true
+  fi
+  if [ -n "${HTTPD_PID}" ]; then
+    kill "${_sig}" "${HTTPD_PID}" 2>/dev/null || true
+  fi
+}
+
+handle_term() {
+  if [ "${_SHUTDOWN}" = "1" ]; then
+    return 0
+  fi
+  _SHUTDOWN=1
+  cleanup_children TERM
+}
+
+handle_hup() {
+  # Forward reload to PgBouncer when running.
+  if [ -n "${PGBOUNCER_PID}" ]; then
+    kill -HUP "${PGBOUNCER_PID}" 2>/dev/null || true
+  fi
+}
+
+trap 'handle_term' TERM INT
+trap 'handle_hup' HUP
+
+start_httpd() {
+  mkdir -p "${WWW_DIR}" 2>/dev/null || true
+  if [ ! -f "${WWW_FILE}" ]; then
+    render_ui || true
+  fi
+  # Prefer busybox-extras httpd (tiny). Fall back to busybox httpd.
+  if command -v busybox-extras >/dev/null 2>&1; then
+    if id postgres >/dev/null 2>&1 && command -v su-exec >/dev/null 2>&1; then
+      su-exec postgres busybox-extras httpd -f -p "${HTTP_PORT}" -h "${WWW_DIR}" &
+    else
+      busybox-extras httpd -f -p "${HTTP_PORT}" -h "${WWW_DIR}" &
+    fi
+    HTTPD_PID="$!"
+    return 0
+  fi
+  if command -v httpd >/dev/null 2>&1; then
+    if id postgres >/dev/null 2>&1 && command -v su-exec >/dev/null 2>&1; then
+      su-exec postgres httpd -f -p "${HTTP_PORT}" -h "${WWW_DIR}" &
+    else
+      httpd -f -p "${HTTP_PORT}" -h "${WWW_DIR}" &
+    fi
+    HTTPD_PID="$!"
+    return 0
+  fi
+  echo "warning: no httpd implementation found; documentation UI unavailable." >&2
+  HTTPD_PID=""
+  return 0
+}
+
+start_pgbouncer() {
+  # Drop privileges: PgBouncer never runs as root.
+  if id postgres >/dev/null 2>&1 && command -v su-exec >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    su-exec postgres "$@" &
+  else
+    # shellcheck disable=SC2086
+    "$@" &
+  fi
+  PGBOUNCER_PID="$!"
+  printf '%s' "${PGBOUNCER_PID}" > "${PGBOUNCER_PID_FILE}.tmp" 2>/dev/null || true
+  mv -f "${PGBOUNCER_PID_FILE}.tmp" "${PGBOUNCER_PID_FILE}" 2>/dev/null || true
+  echo "Starting $* (pid ${PGBOUNCER_PID})..." >&2
+}
+
+# SIGHUP PgBouncer via pid file (usable from the watcher subshell).
+reload_pgbouncer() {
+  _r_pid=""
+  if [ -f "${PGBOUNCER_PID_FILE}" ]; then
+    _r_pid=$(tr -d ' \n' < "${PGBOUNCER_PID_FILE}" 2>/dev/null || printf '')
+  fi
+  if [ -z "${_r_pid}" ] && [ -n "${PGBOUNCER_PID:-}" ]; then
+    _r_pid="${PGBOUNCER_PID}"
+  fi
+  case "${_r_pid}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if kill -0 "${_r_pid}" 2>/dev/null; then
+    kill -HUP "${_r_pid}" 2>/dev/null || return 1
+    return 0
+  fi
+  return 1
+}
+
+# Certificate watcher: content-fingerprint polling (no inotify, no hooks).
+# Handles initial appearance + renewal without container restart.
+# Runs as a background subshell: it shares the filesystem (config, runtime
+# certs, state file, pid file) with the parent but cannot set parent shell
+# variables. All cross-process coordination uses files:
+#  - state file signals TLS_STATE / EXPECT_PGBOUNCER to the parent,
+#  - pid file lets the watcher SIGHUP PgBouncer for reloads.
+# On renewal of an active cert: validate, atomically replace, SIGHUP.
+# On prefer plaintext->TLS: validate, install, rewrite config to require,
+# SIGHUP (native reload), refresh UI/state. Never downgrades TLS->plaintext.
+# On required waiting->active: validate, install, rewrite config, update
+# state file; the parent supervisor starts PgBouncer (no container restart).
+cert_watcher() {
+  # Only automatic candidates need a watcher. Disabled/manual/plaintext
+  # without PUBLIC_HOST exits immediately (no polling, no busy loop).
+  if [ "${AUTO_TLS_CANDIDATE}" != "1" ]; then
+    return 0
+  fi
+  if ! command -v validate_caprover_cert >/dev/null 2>&1; then
+    return 0
+  fi
+  _W_SRC_CERT="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/fullchain.pem"
+  _W_SRC_KEY="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/privkey.pem"
+  # Subshell-local view of TLS state, seeded from the parent at fork and
+  # kept in sync via the state file each iteration.
+  _w_state="${FRONTEND_TLS_STATE}"
+  _w_mode="${PGPOOLER_SSL_MODE}"
+  while :; do
+    sleep "${PGPOOLER_TLS_POLL_INTERVAL}" || true
+    # Refresh state from the file so parent-driven changes are visible.
+    if [ -f "${PGPOOLER_STATE_FILE}" ]; then
+      _w_file_state=$(grep -E '^TLS_STATE=' "${PGPOOLER_STATE_FILE}" 2>/dev/null | tail -n 1 | cut -d= -f2- || printf '')
+      if [ -n "${_w_file_state}" ]; then
+        _w_state="${_w_file_state}"
+      fi
+    fi
+    # Fingerprint current source (follows live/* -> archive/* symlinks).
+    _w_src_fp=""
+    if command -v source_fingerprint >/dev/null 2>&1; then
+      _w_src_fp=$(source_fingerprint "${_W_SRC_CERT}" "${_W_SRC_KEY}" 2>/dev/null || printf '')
+    fi
+    _w_run_fp=""
+    if command -v read_runtime_fingerprint >/dev/null 2>&1; then
+      _w_run_fp=$(read_runtime_fingerprint 2>/dev/null || printf '')
+    fi
+    if [ -z "${_w_src_fp}" ]; then
+      # No source (still waiting or removed). Never downgrade active TLS.
+      continue
+    fi
+    if [ -n "${_w_run_fp}" ] && [ "${_w_src_fp}" = "${_w_run_fp}" ]; then
+      continue
+    fi
+    # New or changed source: validate before any activation.
+    if ! validate_caprover_cert "${_W_SRC_CERT}" "${_W_SRC_KEY}" "${PUBLIC_HOST_SANITIZED}"; then
+      if [ "${_w_state}" = "waiting" ]; then
+        echo "TLS validation: new certificate invalid; still waiting for a valid certificate for ${PUBLIC_HOST_SANITIZED}." >&2
+      else
+        echo "TLS validation: renewed certificate invalid; keeping current frontend TLS state." >&2
+      fi
+      continue
+    fi
+    if ! install_runtime_cert "${_W_SRC_CERT}" "${_W_SRC_KEY}"; then
+      echo "TLS setup: failed to install renewed certificate for ${PUBLIC_HOST_SANITIZED}." >&2
+      continue
+    fi
+    if [ "${_w_state}" = "active" ]; then
+      # Renewal: same file paths, new contents take effect after RELOAD.
+      # Existing client connections stay alive per PgBouncer semantics.
+      echo "Frontend TLS certificate changed; reloading PgBouncer" >&2
+      reload_pgbouncer || true
+      # Runtime fingerprint already updated by install; refresh state/UI.
+      FRONTEND_TLS_STATE="active"
+      FRONTEND_TLS_ACTIVE=1
+      EXPECT_PGBOUNCER=1
+      write_state_file || true
+      render_ui || true
+      _w_state="active"
+      continue
+    fi
+    if [ "${_w_state}" = "plaintext" ] && [ "${_w_mode}" = "prefer" ]; then
+      # Dynamic prefer transition: plaintext -> require without restart.
+      echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; frontend TLS is now required" >&2
+      if update_config_tls_to_require; then
+        FRONTEND_TLS_ACTIVE=1
+        FRONTEND_TLS_STATE="active"
+        EXPECT_PGBOUNCER=1
+        write_state_file || true
+        render_ui || true
+        print_config_redacted >/dev/null 2>&1 || true
+        # Native PgBouncer hot reload applies client_tls_* changes.
+        # Changing TLS settings triggers an automatic RECONNECT for
+        # server connections; existing client connections are preserved
+        # when PgBouncer supports it (verified against 1.25.2 docs and
+        # live tests). No container restart, no plaintext window: the
+        # SIGHUP switches new handshakes to require immediately.
+        reload_pgbouncer || true
+        _w_state="active"
+      else
+        echo "TLS setup: failed to update PgBouncer config for ${PUBLIC_HOST_SANITIZED}." >&2
+      fi
+      continue
+    fi
+    if [ "${_w_state}" = "waiting" ] && [ "${_w_mode}" = "required" ]; then
+      # Required bootstrap: certificate arrived. Install + rewrite config,
+      # update state; the parent supervisor starts PgBouncer (no restart).
+      echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; frontend TLS is now required" >&2
+      if update_config_tls_to_require 2>/dev/null || [ -f "${PG_CONFIG_FILE}" ]; then
+        # Ensure require block exists even if update stripped nothing.
+        if ! grep -q -E '^[[:space:]]*client_tls_sslmode[[:space:]]*=[[:space:]]*require' "${PG_CONFIG_FILE}" 2>/dev/null; then
+          update_config_tls_to_require || true
+        fi
+        FRONTEND_TLS_ACTIVE=1
+        FRONTEND_TLS_STATE="active"
+        EXPECT_PGBOUNCER=1
+        write_state_file || true
+        render_ui || true
+        print_config_redacted >/dev/null 2>&1 || true
+        _w_state="active"
+      else
+        echo "TLS setup: failed to prepare PgBouncer config for ${PUBLIC_HOST_SANITIZED}." >&2
+      fi
+      continue
+    fi
+  done
+}
+
+# Boot supervised children.
+start_httpd
+
+if [ "${EXPECT_PGBOUNCER}" = "1" ]; then
+  # shellcheck disable=SC2086
+  start_pgbouncer "$@"
+else
+  echo "Frontend TLS policy requires a certificate; waiting before starting PgBouncer" >&2
+  echo "HTTP documentation UI remains available on port ${HTTP_PORT}." >&2
+fi
+
+# Watcher runs in background only when automatic discovery is relevant.
+if [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
+  cert_watcher &
+  WATCHER_PID="$!"
+fi
+
+# Supervise: exit when any essential child exits. Waiting mode has no
+# PgBouncer yet; watch httpd + watcher instead.
+if [ "${EXPECT_PGBOUNCER}" = "1" ]; then
+  # Wait for PgBouncer; forward httpd/watcher cleanup on its exit.
+  wait "${PGBOUNCER_PID}" 2>/dev/null || _pgb_status=$?
+  _pgb_status=${_pgb_status:-0}
+  if [ "${_SHUTDOWN}" != "1" ]; then
+    echo "PgBouncer exited (status ${_pgb_status}); shutting down." >&2
+    _SHUTDOWN=1
+    cleanup_children TERM
+  fi
+  wait 2>/dev/null || true
+  rm -f "${PGBOUNCER_PID_FILE}" 2>/dev/null || true
+  exit "${_pgb_status}"
+else
+  # Waiting mode: keep UI + watcher alive until terminated or cert arrives.
+  # The watcher installs the cert and flips the state file to active;
+  # the parent starts PgBouncer (watcher never starts processes itself).
+  while [ "${_SHUTDOWN}" != "1" ]; do
+    if [ -n "${PGBOUNCER_PID}" ]; then
+      wait "${PGBOUNCER_PID}" 2>/dev/null || _pgb_status=$?
+      _pgb_status=${_pgb_status:-0}
+      if [ "${_SHUTDOWN}" != "1" ]; then
+        echo "PgBouncer exited (status ${_pgb_status}); shutting down." >&2
+        _SHUTDOWN=1
+        cleanup_children TERM
+      fi
+      wait 2>/dev/null || true
+      rm -f "${PGBOUNCER_PID_FILE}" 2>/dev/null || true
+      exit "${_pgb_status}"
+    fi
+    sleep 2 2>/dev/null || true
+    if [ -f "${PGPOOLER_STATE_FILE}" ]; then
+      _exp=$(grep -E '^EXPECT_PGBOUNCER=' "${PGPOOLER_STATE_FILE}" 2>/dev/null | tail -n 1 || true)
+      _st=$(grep -E '^TLS_STATE=' "${PGPOOLER_STATE_FILE}" 2>/dev/null | tail -n 1 || true)
+      case "${_exp}" in
+        EXPECT_PGBOUNCER=1)
+          case "${_st}" in
+            TLS_STATE=active)
+              if [ -z "${PGBOUNCER_PID}" ]; then
+                # Watcher installed the cert; parent starts PgBouncer.
+                FRONTEND_TLS_STATE="active"
+                FRONTEND_TLS_ACTIVE=1
+                EXPECT_PGBOUNCER=1
+                start_pgbouncer "$@"
+                # Now supervise the newly started PgBouncer below.
+                wait "${PGBOUNCER_PID}" 2>/dev/null || _pgb_status=$?
+                _pgb_status=${_pgb_status:-0}
+                if [ "${_SHUTDOWN}" != "1" ]; then
+                  echo "PgBouncer exited (status ${_pgb_status}); shutting down." >&2
+                  _SHUTDOWN=1
+                  cleanup_children TERM
+                fi
+                wait 2>/dev/null || true
+                rm -f "${PGBOUNCER_PID_FILE}" 2>/dev/null || true
+                exit "${_pgb_status}"
+              fi
+              ;;
+          esac
+          ;;
+      esac
+    fi
+    # If httpd died unexpectedly, shut down.
+    if [ -n "${HTTPD_PID}" ]; then
+      if ! kill -0 "${HTTPD_PID}" 2>/dev/null; then
+        echo "HTTP UI exited; shutting down." >&2
+        _SHUTDOWN=1
+        cleanup_children TERM
+        wait 2>/dev/null || true
+        exit 1
+      fi
+    fi
+  done
+  wait 2>/dev/null || true
+  exit 0
+fi

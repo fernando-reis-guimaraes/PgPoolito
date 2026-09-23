@@ -9,9 +9,10 @@ multi-stage Alpine `Dockerfile`, plus PgPooler-Uma-specific behavior:
 * image built locally by this repository (`cr.umapps.net/umapps/pgpooler`)
 * multi-architecture build (`linux/amd64`, `linux/arm64` via `compose.yaml`)
 * `.envrc` derives `IMAGE_TAG` from the Git commit
-* dynamic `LISTEN_PORT` healthcheck (`pg_isready` against
-  `${LISTEN_PORT:-5432}`, compatible with `LISTEN_PORT=6432` deployments)
+* credential-free healthcheck (HTTP UI on `8080` plus TCP liveness on
+  `${LISTEN_PORT:-5432}`, no `pg_isready` login, no auth noise)
 * optional independent PgBouncer frontend credentials (see below)
+* CapRover-friendly automatic frontend TLS + documentation UI (see below)
 
 ## PgPooler-Uma extension: independent frontend credentials
 
@@ -142,12 +143,303 @@ may win.
 
 * `LISTEN_PORT` defaults to `5432` (upstream default). Set
   `LISTEN_PORT=6432` for current PgPooler-Uma deployments; the
-  healthcheck follows `LISTEN_PORT` dynamically.
+  healthcheck follows `LISTEN_PORT` dynamically without logging in.
 * Build locally: `docker build -t cr.umapps.net/umapps/pgpooler:beta .`
 * Multi-arch config lives in `compose.yaml`
   (`linux/amd64`, `linux/arm64`).
 * Tests: `./tests/test_pgpooler.sh` (builds image, runs config checks
   plus live PostgreSQL integration, cleans up containers/networks).
+
+## CapRover-friendly TLS + documentation UI
+
+PgPooler-Uma exposes two interfaces on the same hostname:
+
+```text
+https://pgpooler.example.com
+        |
+        | HTTPS :443 handled by CapRover nginx
+        v
+PgPooler-Uma HTTP documentation UI :8080
+
+
+postgresql://pgpooler.example.com:6432
+        |
+        | PostgreSQL protocol, optionally/mandatorily TLS
+        v
+PgBouncer :6432
+        |
+        | existing backend TLS configuration
+        v
+PostgreSQL
+```
+
+The plain HTTP UI exists so the CapRover application can be deployed as
+a normal web application, CapRover can obtain and manage a Let's Encrypt
+certificate for the hostname, and PgBouncer can reuse that same
+certificate on its PostgreSQL TCP port. Certificate validity is by
+hostname, not by port. No ACME client or Certbot is bundled; CapRover
+remains the certificate orchestrator.
+
+### Web UI on port 8080
+
+A minimal static page (served by `busybox-extras httpd`, no framework,
+no login, no database API) is available on port `8080`. It shows:
+
+```text
+PgPooler-Uma
+
+PostgreSQL Connection Pooler
+
+Host
+<public hostname>
+
+Port
+<LISTEN_PORT>
+
+Database
+<DB_NAME>
+
+TLS
+<current frontend TLS state>
+
+Connection string
+postgresql://<USERNAME>:<PASSWORD>@<HOST>:<PORT>/<DATABASE>?sslmode=<appropriate mode>
+```
+
+`<USERNAME>` and `<PASSWORD>` are always literal placeholders. Real
+`PGBOUNCER_USER`, `PGBOUNCER_PASSWORD`, `DB_USER`, or `DB_PASSWORD`
+values never appear in visible text, HTML source, comments, attributes,
+or generated files. Backend host credentials are never displayed. The
+database name is shown because it is not a secret. All displayed values
+are HTML-escaped.
+
+TLS status strings include:
+
+```text
+Disabled
+Not available - plaintext currently enabled
+Available and required
+Required - waiting for certificate
+```
+
+When TLS is active the page recommends `sslmode=verify-full`. When no
+certificate is active it shows `sslmode=disable` and never misleads with
+`verify-full`. When `PUBLIC_HOST` is absent the page derives the display
+host from the browser request hostname (`window.location.hostname`);
+automatic certificate selection never guesses in that case.
+
+### CapRover deployment model
+
+Recommended CapRover settings:
+
+* Container HTTP Port: `8080`
+* Enable HTTPS for the application hostname when a public domain is used.
+* Force HTTPS for the Web UI is recommended.
+* Separate public port mapping for PostgreSQL, for example `6432 -> 6432`
+  (CapRover port mapping / Docker publish to PgBouncer `LISTEN_PORT`).
+
+Read-only bind mount for the host Let's Encrypt tree:
+
+```text
+/captain/data/letencrypt/etc:/caprover-letsencrypt:ro
+```
+
+The container never mutates, chmods, or chowns anything under
+`/caprover-letsencrypt`. No Docker socket, no CapRover API, and no
+config parsing are required.
+
+### PUBLIC_HOST
+
+```text
+PUBLIC_HOST=pgpooler.example.com
+```
+
+Single canonical explicit hostname. Used for Web UI examples, locating
+the matching certificate at
+`/caprover-letsencrypt/live/${PUBLIC_HOST}/fullchain.pem` and
+`privkey.pem`, and validating hostname ownership. No separate TLS domain
+variable exists. When absent (for example local deployments without a
+domain) automatic certificate discovery is inactive and the UI derives
+the display host from the request. The value is treated as untrusted
+input and strictly validated as a single DNS hostname.
+
+### PGPOOLER_SSL_MODE
+
+```text
+PGPOOLER_SSL_MODE=disabled|prefer|required
+```
+
+Default: `prefer`. This is a PgPooler-Uma policy setting and is NOT
+equivalent to PgBouncer native `client_tls_sslmode=prefer`.
+
+* `disabled`: never automatically enable frontend TLS. Certificate
+  presence is ignored for automatic purposes. Effective frontend
+  behavior is `client_tls_sslmode = disable`. No watcher is required.
+
+* `prefer`: operate without TLS only while TLS is unavailable; once a
+  valid certificate is available, require TLS. Without a certificate
+  PgBouncer starts plaintext. With a valid certificate PgBouncer uses
+  `client_tls_sslmode = require` and plaintext is rejected. If a
+  certificate appears later (for example after enabling HTTPS in
+  CapRover) it is detected automatically, installed, and PgBouncer is
+  switched to `require` without restarting the container. This does NOT
+  mean native `prefer` (which would keep accepting plaintext).
+
+* `required`: frontend TLS is mandatory. Without a valid certificate the
+  HTTP UI still runs but PgBouncer does not expose a PostgreSQL
+  listener; plaintext is never temporarily exposed. The container stays
+  stable (not crash-looping) and logs that it is waiting. When a valid
+  certificate appears it is prepared automatically, PgBouncer starts
+  with `client_tls_sslmode = require`, and the first PostgreSQL
+  connection already requires TLS. There is no plaintext window.
+
+Once automatic TLS is active, both `prefer` and `required` result in
+native `client_tls_sslmode = require`.
+
+### Frontend vs backend TLS
+
+Frontend (client to PgBouncer) and backend (PgBouncer to PostgreSQL) are
+independent hops:
+
+```text
+application -- frontend TLS (CLIENT_TLS_*/automatic) --> PgBouncer
+PgBouncer   -- SERVER_TLS_SSLMODE=verify-full ----------> PostgreSQL
+```
+
+Existing `SERVER_TLS_*` semantics are unchanged. Existing manual
+`CLIENT_TLS_*` support remains for advanced and non-CapRover users.
+
+Precedence: `PGPOOLER_SSL_MODE` controls automatic CapRover behavior.
+Manually specifying `CLIENT_TLS_CERT_FILE`, `CLIENT_TLS_KEY_FILE`, or
+`CLIENT_TLS_SSLMODE` together with `PUBLIC_HOST` automatic discovery
+fails fast with a clear error instead of silently mixing sources.
+`CLIENT_TLS_CA_FILE`, `CLIENT_TLS_PROTOCOLS`, `CLIENT_TLS_CIPHERS`,
+`CLIENT_TLS_ECDHCURVE`, and `CLIENT_TLS_DHEPARAMS` may accompany
+automatic TLS as hardening extras. Without `PUBLIC_HOST`, default
+`prefer` stays plaintext unless manual `CLIENT_TLS_*` is provided, so
+upgrading the image does not break existing manual deployments. In
+`disabled` mode automatic discovery is off and manual settings pass
+through. In `required` mode without `PUBLIC_HOST`, manual TLS must
+already enforce `require` or stricter.
+
+### Certificate validation
+
+Filenames alone are never sufficient. Before activation the privileged
+bootstrap and watcher validate with OpenSSL (no fragile parsing, no
+secret output):
+
+* both files exist and are readable,
+* certificate is parseable (`openssl x509 -noout`),
+* currently valid (`-checkend 0` plus `notBefore` comparison without GNU
+  date dependency),
+* hostname matches `PUBLIC_HOST` (`openssl x509 -checkhost`, SAN and
+  wildcard aware),
+* private key corresponds to the certificate (public-part comparison,
+  never printed).
+
+Invalid certificates: in `prefer` mode plaintext continues with a clear
+log reason; in `required` mode PostgreSQL stays unavailable while
+waiting. An active TLS state is never automatically downgraded to
+plaintext.
+
+### Runtime copies and renewal
+
+Source files stay untouched. Validated certificates are copied to a
+private runtime directory:
+
+```text
+/run/pgbouncer/tls/fullchain.pem
+/run/pgbouncer/tls/privkey.pem
+```
+
+Files are `0600` owned by `postgres`, the directory is `0700`, replacement
+is atomic (`tmp` plus `mv`), and PgBouncer never runs as root (dropped
+via `su-exec`). A polling watcher (default 300 seconds,
+`PGPOOLER_TLS_POLL_INTERVAL` override for tests and tuning) uses
+content fingerprints (`sha256sum`, following `live/* -> archive/*`
+symlinks) to detect initial appearance and renewal without container
+restarts, Certbot hooks, or inotify. On renewal the new pair is
+validated first, atomically installed, and PgBouncer is reloaded with
+`SIGHUP` (`RELOAD`); existing client connections stay alive per PgBouncer
+semantics and new TLS handshakes receive the renewed certificate.
+Changing TLS settings triggers an automatic server-side `RECONNECT`;
+verified live against PgBouncer 1.25.2 that `disable -> require` applies
+via `SIGHUP` with new plaintext rejected and no container restart.
+
+### Production example
+
+```env
+PUBLIC_HOST=pgpooler.example.com
+PGPOOLER_SSL_MODE=required
+
+LISTEN_PORT=6432
+
+PGBOUNCER_USER=...
+PGBOUNCER_PASSWORD=...
+
+DB_HOST=...
+DB_PORT=5432
+DB_NAME=crud
+DB_USER=...
+DB_PASSWORD=...
+
+AUTH_TYPE=scram-sha-256
+
+SERVER_TLS_SSLMODE=verify-full
+```
+
+CapRover volume plus ports:
+
+```text
+/captain/data/letencrypt/etc:/caprover-letsencrypt:ro
+Container HTTP Port: 8080 (HTTPS via CapRover nginx)
+Public port mapping: 6432 -> 6432 (PostgreSQL/TLS direct to PgBouncer)
+```
+
+Connection documentation (placeholders only):
+
+```text
+postgresql://<USERNAME>:<PASSWORD>@pgpooler.example.com:6432/crud?sslmode=verify-full
+```
+
+### Local example (no domain)
+
+```env
+PGPOOLER_SSL_MODE=prefer
+LISTEN_PORT=6432
+PGBOUNCER_USER=...
+PGBOUNCER_PASSWORD=...
+DB_HOST=...
+DB_NAME=crud
+DB_USER=...
+DB_PASSWORD=...
+```
+
+No `PUBLIC_HOST`, no certificate mount. UI on `http://localhost:8080`,
+plaintext PostgreSQL with `sslmode=disable` in examples.
+
+### Manual TLS example (non-CapRover)
+
+```env
+PGPOOLER_SSL_MODE=disabled
+LISTEN_PORT=6432
+CLIENT_TLS_SSLMODE=require
+CLIENT_TLS_CERT_FILE=/certs/fullchain.pem
+CLIENT_TLS_KEY_FILE=/certs/privkey.pem
+```
+
+Mount custom certificates read-only and manage renewal externally with a
+container restart or `SIGHUP`. Do not combine manual identity settings
+with `PUBLIC_HOST` automatic discovery.
+
+### Healthcheck
+
+No `pg_isready` login and no credential noise. The check verifies the
+HTTP UI on `8080` and, when PgBouncer is expected to run, TCP liveness
+on `LISTEN_PORT` via `nc -z` (no PostgreSQL handshake). In
+`required` waiting state UI availability alone is healthy; the container
+is not marked broken while CapRover has not issued the first
+certificate.
 
 ## Tracking upstream
 
