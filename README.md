@@ -72,27 +72,40 @@ PGPASSWORD='<proxy password>' psql -h 127.0.0.1 -p 6432 -U app_pooler -d databas
 ```
 
 The pair is optional and backward-compatible. Implementation uses
-PgBouncer's database-level forced-user feature (`user=<DB_USER>` in the
-generated `[databases]` entry). It does NOT misuse `auth_user`
-(`auth_user` is for `auth_query` lookup, not for forcing backend
-connections). `DB_PASSWORD` is kept in `auth_file`, never written into
-`pgbouncer.ini`, and never printed to logs. Existing `AUTH_FILE` and
-`AUTH_TYPE` (`md5` / `plain` / `scram-sha-256`) behavior is preserved.
+PgBouncer's native database parameters (`user=<DB_USER>` and
+`password=<DB_PASSWORD>` in the generated `[databases]` entry), for
+example:
+
+```ini
+[databases]
+mydb = host=postgres.example port=5432 dbname=mydb user=neondb_owner password=database-secret
+```
+
+It does NOT misuse `auth_user` (`auth_user` is for `auth_query` lookup,
+not for forcing backend connections). In split mode the frontend
+`auth_file` holds ONLY `PGBOUNCER_USER`; `DB_USER` is never inserted
+there, and the generated per-database entry omits `auth_user`
+(otherwise PgBouncer would still accept the backend user as a frontend
+login), so backend credentials cannot authenticate TO PgBouncer.
+Generated `pgbouncer.ini`/`userlist.txt` are mode `0600`, startup
+diagnostics print only a password-redacted config, and passwords are
+never logged. Existing `AUTH_FILE` behavior is preserved; frontend
+`PGBOUNCER_USER` encoding follows existing `AUTH_TYPE`
+(`md5` / `plain` / `scram-sha-256`), while backend `DB_PASSWORD` is
+independent of `AUTH_TYPE`.
 
 Validation (fail fast, no silent fallback):
 
 * exactly one of `PGBOUNCER_USER` / `PGBOUNCER_PASSWORD` set → startup fails
-* `PGBOUNCER_USER == DB_USER` but passwords differ → startup fails
-  (one `auth_file` username cannot represent two passwords)
-* identical username + password is treated as effectively legacy credentials
 
 ### DATABASE_URL / DATABASE_URLS
 
 Upstream `DATABASE_URL`, `DATABASE_URLS`, and separate `DB_*` support is
 preserved. Split frontend credentials are global PgBouncer client
 credentials; each backend entry parsed from a URL keeps its own
-backend username/password and gets its own forced `user=` when split
-mode is active.
+backend username/password and generates its own `user=` + `password=`.
+Backend users are never added to the frontend `auth_file`. Take care
+not to log URLs containing passwords.
 
 Limitation: when `DATABASE_URLS` is combined with split credentials,
 use distinct database names per URL. Overlapping or wildcard (`*`)

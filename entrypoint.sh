@@ -15,14 +15,17 @@ _AUTH_FILE="${AUTH_FILE:-$PG_CONFIG_DIR/userlist.txt}"
 if [ ! -e "${_AUTH_FILE}" ]; then
   touch "${_AUTH_FILE}"
 fi
+# Restrict auth file permissions (contains credentials).
+chmod 0600 "${_AUTH_FILE}" 2>/dev/null || true
 
 # PgPooler-Uma extension: optional independent frontend credentials.
 # PGBOUNCER_USER / PGBOUNCER_PASSWORD authenticate applications connecting
-# TO PgBouncer, while DB_USER / DB_PASSWORD remain the credentials PgBouncer
-# uses when connecting FROM PgBouncer TO PostgreSQL.
+# TO PgBouncer, while DB_USER / DB_PASSWORD are the credentials PgBouncer
+# uses FROM PgBouncer TO PostgreSQL via native `user=` / `password=`
+# database parameters.
 # Legacy mode (neither set) is fully backward-compatible with upstream.
-# Split mode (both set) forces backend connections via `user=<DB_USER>`
-# in the generated [databases] entries.
+# Split mode (both set): auth_file holds ONLY the frontend credential;
+# backend credentials live ONLY in the generated [databases] entry.
 SPLIT_AUTH=0
 if [ -n "${PGBOUNCER_USER:-}" ] || [ -n "${PGBOUNCER_PASSWORD:-}" ]; then
   if [ -z "${PGBOUNCER_USER:-}" ] || [ -z "${PGBOUNCER_PASSWORD:-}" ]; then
@@ -80,6 +83,7 @@ write_user_entry() {
   if [ ! -e "${_AUTH_FILE}" ]; then
     touch "${_AUTH_FILE}"
   fi
+  chmod 0600 "${_AUTH_FILE}" 2>/dev/null || true
   if grep -q "^\"${_w_user}\"" "${_AUTH_FILE}"; then
     return 0
   fi
@@ -92,50 +96,69 @@ write_user_entry() {
   echo "Wrote authentication credentials for '${_w_user}' to ${_AUTH_FILE}"
 }
 
-# Grabs variables set by `parse_url` and adds them to the userlist if not already set in there.
+# Legacy backend auth: only when split mode is OFF, to remain
+# upstream-compatible. In split mode the backend credential must NOT
+# enter the frontend auth_file.
 generate_userlist_if_needed() {
+  if [ "${SPLIT_AUTH}" = "1" ]; then
+    return 0
+  fi
   if [ -n "${DB_USER:-}" ] && [ -n "${DB_PASSWORD:-}" ] && [ -e "${_AUTH_FILE}" ]; then
     write_user_entry "${DB_USER}" "${DB_PASSWORD}"
   fi
 }
 
-# Fail fast when one auth_file username cannot safely represent two
-# different passwords. Identical user+password pairs are treated as
-# effectively legacy credentials and allowed.
-check_split_conflict() {
-  _c_buser="$1"
-  _c_bpass="$2"
+# Frontend auth: only in split mode, writes PGBOUNCER_USER to auth_file.
+ensure_frontend_auth() {
   if [ "${SPLIT_AUTH}" = "1" ]; then
-    if [ -n "${_c_buser}" ] && [ "${_c_buser}" = "${PGBOUNCER_USER}" ]; then
-      if [ "${_c_bpass}" != "${PGBOUNCER_PASSWORD}" ]; then
-        echo "error: PGBOUNCER_USER '${PGBOUNCER_USER}' matches backend DB_USER but passwords differ." >&2
-        echo "error: one auth_file username cannot represent two different passwords; refusing to start." >&2
-        exit 1
-      fi
-    fi
+    write_user_entry "${PGBOUNCER_USER}" "${PGBOUNCER_PASSWORD}"
   fi
 }
 
 # Grabs variables set by `parse_url` and adds them to the PG config file as a database entry.
-# In split-credential mode, forces the backend connection to use DB_USER via
-# PgBouncer's database-level `user=` feature. AUTH_USER handling is unchanged.
+# Legacy mode: upstream format unchanged (auth_user only).
+# Split mode: native backend `user=` + `password=` WITHOUT per-database
+# `auth_user`, otherwise PgBouncer would still accept the backend user as
+# a frontend login (isolation breach). Global AUTH_USER handling unchanged.
 generate_config_db_entry() {
-  if [ "${SPLIT_AUTH}" = "1" ] && [ -n "${DB_USER:-}" ]; then
-    _forced_backend_user=" user=${DB_USER}"
-  else
-    _forced_backend_user=""
-  fi
-  printf "\
+  if [ "${SPLIT_AUTH}" = "1" ]; then
+    if [ -n "${DB_USER:-}" ]; then
+      _forced_user=" user=${DB_USER}"
+    else
+      _forced_user=""
+    fi
+    if [ -n "${DB_PASSWORD:-}" ]; then
+      _backend_password=" password=${DB_PASSWORD}"
+    else
+      _backend_password=""
+    fi
+    printf "\
 ${DB_NAME:-*} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} \
-port=${DB_PORT:-5432} auth_user=${DB_USER:-postgres}${_forced_backend_user}
+port=${DB_PORT:-5432}${_forced_user}${_backend_password}
 ${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
 " >> "${PG_CONFIG_FILE}"
+  else
+    printf "\
+${DB_NAME:-*} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} \
+port=${DB_PORT:-5432} auth_user=${DB_USER:-postgres}
+${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
+" >> "${PG_CONFIG_FILE}"
+  fi
+}
+
+# Print generated config with password values redacted. Never print raw secrets.
+print_config_redacted() {
+  if [ -f "${PG_CONFIG_FILE}" ]; then
+    sed -e 's/password=.*/password=***REDACTED***/' "${PG_CONFIG_FILE}" || printf '%s\n' "(unable to display redacted config)"
+  fi
 }
 
 # Write the password with MD5 encryption, to avoid printing it during startup.
 # Notice that `docker inspect` will show unencrypted env variables.
 # NOTE: comma-separated iteration runs in the main shell (no pipe subshell)
-# so that split-credential validation failures correctly abort startup.
+# so that validation failures correctly abort startup.
+# In split mode backend users are NOT added to auth_file; only the
+# frontend credential is added once after parsing.
 if [ -n "${DATABASE_URLS:-}" ]; then
   _urls_rest="${DATABASE_URLS},"
   while [ -n "${_urls_rest}" ]; do
@@ -148,21 +171,15 @@ if [ -n "${DATABASE_URLS:-}" ]; then
       continue
     fi
     parse_url "${_cur_url}"
-    check_split_conflict "${DB_USER:-}" "${DB_PASSWORD:-}"
     generate_userlist_if_needed
   done
-  if [ "${SPLIT_AUTH}" = "1" ]; then
-    write_user_entry "${PGBOUNCER_USER}" "${PGBOUNCER_PASSWORD}"
-  fi
+  ensure_frontend_auth
 else
   if [ -n "${DATABASE_URL:-}" ]; then
     parse_url "${DATABASE_URL}"
   fi
-  check_split_conflict "${DB_USER:-}" "${DB_PASSWORD:-}"
   generate_userlist_if_needed
-  if [ "${SPLIT_AUTH}" = "1" ]; then
-    write_user_entry "${PGBOUNCER_USER}" "${PGBOUNCER_PASSWORD}"
-  fi
+  ensure_frontend_auth
 fi
 
 if [ ! -f "${PG_CONFIG_FILE}" ]; then
@@ -284,8 +301,13 @@ ${TCP_KEEPINTVL:+tcp_keepintvl = ${TCP_KEEPINTVL}\n}\
 ${TCP_USER_TIMEOUT:+tcp_user_timeout = ${TCP_USER_TIMEOUT}\n}\
 ################## end file ##################
 " >> "${PG_CONFIG_FILE}"
-  cat "${PG_CONFIG_FILE}"
+  chmod 0600 "${PG_CONFIG_FILE}" 2>/dev/null || true
+  print_config_redacted
 fi
+
+# Ensure restrictive permissions on generated files (may already exist).
+chmod 0600 "${PG_CONFIG_FILE}" 2>/dev/null || true
+chmod 0600 "${_AUTH_FILE}" 2>/dev/null || true
 
 echo "Starting $*..."
 exec "$@"
