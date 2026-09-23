@@ -16,12 +16,29 @@ if [ ! -e "${_AUTH_FILE}" ]; then
   touch "${_AUTH_FILE}"
 fi
 
+# PgPooler-Uma extension: optional independent frontend credentials.
+# PGBOUNCER_USER / PGBOUNCER_PASSWORD authenticate applications connecting
+# TO PgBouncer, while DB_USER / DB_PASSWORD remain the credentials PgBouncer
+# uses when connecting FROM PgBouncer TO PostgreSQL.
+# Legacy mode (neither set) is fully backward-compatible with upstream.
+# Split mode (both set) forces backend connections via `user=<DB_USER>`
+# in the generated [databases] entries.
+SPLIT_AUTH=0
+if [ -n "${PGBOUNCER_USER:-}" ] || [ -n "${PGBOUNCER_PASSWORD:-}" ]; then
+  if [ -z "${PGBOUNCER_USER:-}" ] || [ -z "${PGBOUNCER_PASSWORD:-}" ]; then
+    echo "error: PGBOUNCER_USER and PGBOUNCER_PASSWORD must be set together (both or neither)." >&2
+    echo "error: refusing to start with a partial frontend credential pair." >&2
+    exit 1
+  fi
+  SPLIT_AUTH=1
+fi
+
 # Extract all info from a given URL. Sets variables because shell functions can't return multiple values.
 #
 # Parameters:
 #   - The url we should parse
 # Returns (sets variables): DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME
-function parse_url() {
+parse_url() {
   # Thanks to https://stackoverflow.com/a/17287984/146289
 
   # Allow to pass values like dj-database-url / django-environ accept
@@ -50,40 +67,102 @@ function parse_url() {
   DB_NAME="$(echo $url | grep / | cut -d/ -f2-)"
 }
 
+# Write a single username/password pair to the auth file, preserving the
+# existing AUTH_TYPE behavior (md5 / plain / scram-sha-256).
+# Skips empty credentials and avoids duplicate entries.
+# Never prints passwords; only logs the username.
+write_user_entry() {
+  _w_user="$1"
+  _w_pass="$2"
+  if [ -z "${_w_user}" ] || [ -z "${_w_pass}" ]; then
+    return 0
+  fi
+  if [ ! -e "${_AUTH_FILE}" ]; then
+    touch "${_AUTH_FILE}"
+  fi
+  if grep -q "^\"${_w_user}\"" "${_AUTH_FILE}"; then
+    return 0
+  fi
+  if [ "${AUTH_TYPE:-}" = "plain" ] || [ "${AUTH_TYPE:-}" = "scram-sha-256" ]; then
+    _w_hash="${_w_pass}"
+  else
+    _w_hash="md5$(printf '%s' "${_w_pass}${_w_user}" | md5sum | cut -f 1 -d ' ')"
+  fi
+  printf '"%s" "%s"\n' "${_w_user}" "${_w_hash}" >> "${_AUTH_FILE}"
+  echo "Wrote authentication credentials for '${_w_user}' to ${_AUTH_FILE}"
+}
+
 # Grabs variables set by `parse_url` and adds them to the userlist if not already set in there.
-function generate_userlist_if_needed() {
-  if [ -n "${DB_USER}" -a -n "${DB_PASSWORD}" -a -e "${_AUTH_FILE}" ] && ! grep -q "^\"${DB_USER}\"" "${_AUTH_FILE}"; then
-    if [ "${AUTH_TYPE}" == "plain" ] || [ "${AUTH_TYPE}" == "scram-sha-256" ]; then
-      pass="${DB_PASSWORD}"
-    else
-      pass="md5$(echo -n "${DB_PASSWORD}${DB_USER}" | md5sum | cut -f 1 -d ' ')"
+generate_userlist_if_needed() {
+  if [ -n "${DB_USER:-}" ] && [ -n "${DB_PASSWORD:-}" ] && [ -e "${_AUTH_FILE}" ]; then
+    write_user_entry "${DB_USER}" "${DB_PASSWORD}"
+  fi
+}
+
+# Fail fast when one auth_file username cannot safely represent two
+# different passwords. Identical user+password pairs are treated as
+# effectively legacy credentials and allowed.
+check_split_conflict() {
+  _c_buser="$1"
+  _c_bpass="$2"
+  if [ "${SPLIT_AUTH}" = "1" ]; then
+    if [ -n "${_c_buser}" ] && [ "${_c_buser}" = "${PGBOUNCER_USER}" ]; then
+      if [ "${_c_bpass}" != "${PGBOUNCER_PASSWORD}" ]; then
+        echo "error: PGBOUNCER_USER '${PGBOUNCER_USER}' matches backend DB_USER but passwords differ." >&2
+        echo "error: one auth_file username cannot represent two different passwords; refusing to start." >&2
+        exit 1
+      fi
     fi
-    echo "\"${DB_USER}\" \"${pass}\"" >> "${_AUTH_FILE}"
-    echo "Wrote authentication credentials for '${DB_USER}' to ${_AUTH_FILE}"
   fi
 }
 
 # Grabs variables set by `parse_url` and adds them to the PG config file as a database entry.
-function generate_config_db_entry() {
+# In split-credential mode, forces the backend connection to use DB_USER via
+# PgBouncer's database-level `user=` feature. AUTH_USER handling is unchanged.
+generate_config_db_entry() {
+  if [ "${SPLIT_AUTH}" = "1" ] && [ -n "${DB_USER:-}" ]; then
+    _forced_backend_user=" user=${DB_USER}"
+  else
+    _forced_backend_user=""
+  fi
   printf "\
 ${DB_NAME:-*} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} \
-port=${DB_PORT:-5432} auth_user=${DB_USER:-postgres}
+port=${DB_PORT:-5432} auth_user=${DB_USER:-postgres}${_forced_backend_user}
 ${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
 " >> "${PG_CONFIG_FILE}"
 }
 
 # Write the password with MD5 encryption, to avoid printing it during startup.
 # Notice that `docker inspect` will show unencrypted env variables.
-if [ -n "${DATABASE_URLS}" ]; then
-  echo "${DATABASE_URLS}" | tr , '\n' | while read url; do
-    parse_url "$url"
+# NOTE: comma-separated iteration runs in the main shell (no pipe subshell)
+# so that split-credential validation failures correctly abort startup.
+if [ -n "${DATABASE_URLS:-}" ]; then
+  _urls_rest="${DATABASE_URLS},"
+  while [ -n "${_urls_rest}" ]; do
+    _cur_url="${_urls_rest%%,*}"
+    case "${_urls_rest}" in
+      *,*) _urls_rest="${_urls_rest#*,}" ;;
+      *) _urls_rest="" ;;
+    esac
+    if [ -z "${_cur_url}" ]; then
+      continue
+    fi
+    parse_url "${_cur_url}"
+    check_split_conflict "${DB_USER:-}" "${DB_PASSWORD:-}"
     generate_userlist_if_needed
   done
+  if [ "${SPLIT_AUTH}" = "1" ]; then
+    write_user_entry "${PGBOUNCER_USER}" "${PGBOUNCER_PASSWORD}"
+  fi
 else
-  if [ -n "${DATABASE_URL}" ]; then
+  if [ -n "${DATABASE_URL:-}" ]; then
     parse_url "${DATABASE_URL}"
   fi
+  check_split_conflict "${DB_USER:-}" "${DB_PASSWORD:-}"
   generate_userlist_if_needed
+  if [ "${SPLIT_AUTH}" = "1" ]; then
+    write_user_entry "${PGBOUNCER_USER}" "${PGBOUNCER_PASSWORD}"
+  fi
 fi
 
 if [ ! -f "${PG_CONFIG_FILE}" ]; then
@@ -97,14 +176,23 @@ if [ ! -f "${PG_CONFIG_FILE}" ]; then
 [databases]
 " > "${PG_CONFIG_FILE}"
 
-  if [ -n "$DATABASE_URLS" ]; then
-    echo "$DATABASE_URLS" | tr , '\n' | while read url; do
-      parse_url "$url"
+  if [ -n "${DATABASE_URLS:-}" ]; then
+    _urls_rest="${DATABASE_URLS},"
+    while [ -n "${_urls_rest}" ]; do
+      _cur_url="${_urls_rest%%,*}"
+      case "${_urls_rest}" in
+        *,*) _urls_rest="${_urls_rest#*,}" ;;
+        *) _urls_rest="" ;;
+      esac
+      if [ -z "${_cur_url}" ]; then
+        continue
+      fi
+      parse_url "${_cur_url}"
       generate_config_db_entry
     done
   else
-    if [ -n "$DATABASE_URL" ]; then
-      parse_url "$DATABASE_URL"
+    if [ -n "${DATABASE_URL:-}" ]; then
+      parse_url "${DATABASE_URL}"
     fi
     generate_config_db_entry
   fi

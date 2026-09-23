@@ -1,3 +1,139 @@
+# PgPooler-Uma
+
+Maintained fork of [`edoburu/docker-pgbouncer`](https://github.com/edoburu/docker-pgbouncer).
+
+This repository tracks upstream `master` through real Git merges (both
+histories preserved) and builds PgBouncer from source via the upstream
+multi-stage Alpine `Dockerfile`, plus PgPooler-Uma-specific behavior:
+
+* image built locally by this repository (`cr.umapps.net/umapps/pgpooler`)
+* multi-architecture build (`linux/amd64`, `linux/arm64` via `compose.yaml`)
+* `.envrc` derives `IMAGE_TAG` from the Git commit
+* dynamic `LISTEN_PORT` healthcheck (`pg_isready` against
+  `${LISTEN_PORT:-5432}`, compatible with `LISTEN_PORT=6432` deployments)
+* optional independent PgBouncer frontend credentials (see below)
+
+## PgPooler-Uma extension: independent frontend credentials
+
+Upstream uses `DB_USER` / `DB_PASSWORD` both to populate `userlist.txt`
+and to connect to PostgreSQL.
+
+This fork adds an OPTIONAL second credential pair:
+
+* `PGBOUNCER_USER`
+* `PGBOUNCER_PASSWORD`
+
+These authenticate applications connecting TO PgBouncer, while
+`DB_USER` / `DB_PASSWORD` remain the credentials PgBouncer uses
+FROM PgBouncer TO PostgreSQL:
+
+```text
+Application -- PGBOUNCER_USER / PGBOUNCER_PASSWORD --> PgBouncer
+PgBouncer   -- DB_USER / DB_PASSWORD ----------------> PostgreSQL
+```
+
+### Traditional / upstream-compatible configuration
+
+```sh
+docker run --rm \
+  -e DB_USER=user \
+  -e DB_PASSWORD=pass \
+  -e DB_HOST=postgres-host \
+  -e DB_NAME=database \
+  -p 5432:5432 \
+  cr.umapps.net/umapps/pgpooler:beta
+```
+
+Without `PGBOUNCER_*`, behavior is exactly upstream.
+
+### Split credentials
+
+```sh
+docker run --rm \
+  -e DB_USER=neondb_owner \
+  -e DB_PASSWORD='<database password>' \
+  -e DB_HOST=postgres-host \
+  -e DB_NAME=database \
+  -e PGBOUNCER_USER=app_pooler \
+  -e PGBOUNCER_PASSWORD='<proxy password>' \
+  -e LISTEN_PORT=6432 \
+  -p 6432:6432 \
+  cr.umapps.net/umapps/pgpooler:beta
+```
+
+* application connects to PgBouncer as `app_pooler`
+* PgBouncer connects to PostgreSQL as `neondb_owner`
+
+```sh
+PGPASSWORD='<proxy password>' psql -h 127.0.0.1 -p 6432 -U app_pooler -d database -c "SELECT current_user;"
+# current_user
+# --------------
+#  neondb_owner
+```
+
+The pair is optional and backward-compatible. Implementation uses
+PgBouncer's database-level forced-user feature (`user=<DB_USER>` in the
+generated `[databases]` entry). It does NOT misuse `auth_user`
+(`auth_user` is for `auth_query` lookup, not for forcing backend
+connections). `DB_PASSWORD` is kept in `auth_file`, never written into
+`pgbouncer.ini`, and never printed to logs. Existing `AUTH_FILE` and
+`AUTH_TYPE` (`md5` / `plain` / `scram-sha-256`) behavior is preserved.
+
+Validation (fail fast, no silent fallback):
+
+* exactly one of `PGBOUNCER_USER` / `PGBOUNCER_PASSWORD` set → startup fails
+* `PGBOUNCER_USER == DB_USER` but passwords differ → startup fails
+  (one `auth_file` username cannot represent two passwords)
+* identical username + password is treated as effectively legacy credentials
+
+### DATABASE_URL / DATABASE_URLS
+
+Upstream `DATABASE_URL`, `DATABASE_URLS`, and separate `DB_*` support is
+preserved. Split frontend credentials are global PgBouncer client
+credentials; each backend entry parsed from a URL keeps its own
+backend username/password and gets its own forced `user=` when split
+mode is active.
+
+Limitation: when `DATABASE_URLS` is combined with split credentials,
+use distinct database names per URL. Overlapping or wildcard (`*`)
+entries sharing one dbname with different backend users are inherently
+ambiguous in `pgbouncer.ini` and unsupported; the last matching entry
+may win.
+
+### Deployment notes
+
+* `LISTEN_PORT` defaults to `5432` (upstream default). Set
+  `LISTEN_PORT=6432` for current PgPooler-Uma deployments; the
+  healthcheck follows `LISTEN_PORT` dynamically.
+* Build locally: `docker build -t cr.umapps.net/umapps/pgpooler:beta .`
+* Multi-arch config lives in `compose.yaml`
+  (`linux/amd64`, `linux/arm64`).
+* Tests: `./tests/test_pgpooler.sh` (builds image, runs config checks
+  plus live PostgreSQL integration, cleans up containers/networks).
+
+## Tracking upstream
+
+Canonical upstream remote:
+
+```sh
+git remote add upstream https://github.com/edoburu/docker-pgbouncer.git
+git fetch upstream --tags
+```
+
+Normal update workflow:
+
+```sh
+git fetch upstream
+git merge --no-ff upstream/master
+```
+
+Do not rebase, squash, or rewrite either history. Preserve both
+lineages through merge commits.
+
+---
+
+## Upstream documentation (preserved)
+
 PgBouncer Docker image
 ======================
 

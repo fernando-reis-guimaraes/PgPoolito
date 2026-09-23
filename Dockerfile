@@ -25,8 +25,7 @@ COPY --from=build /pgbouncer/etc/userlist.txt /etc/pgbouncer/userlist.txt.exampl
 EXPOSE 5432 6432
 USER postgres
 # Honor runtime LISTEN_PORT (default matches upstream listen_port 5432).
-# $$ escapes build-time expansion so the container shell expands LISTEN_PORT at runtime.
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=10s \
-  CMD-SHELL pg_isready -h 127.0.0.1 -p $${LISTEN_PORT:-5432}
+  CMD pg_isready -h 127.0.0.1 -p ${LISTEN_PORT:-5432}
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/bin/pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
