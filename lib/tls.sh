@@ -20,6 +20,16 @@ TLS_APPLIED_FILE="${TLS_RUNTIME_DIR}/.fingerprint"
 # attempt so a failed reload can restore the last working files.
 TLS_PREV_CERT="${TLS_RUNTIME_DIR}/.fullchain.pem.prev"
 TLS_PREV_KEY="${TLS_RUNTIME_DIR}/.privkey.pem.prev"
+# Test-only fault-injection flags (runtime files, absent by default).
+# The test harness creates/removes them inside a running container to
+# force deterministic backup or endpoint-verification failures. They are
+# never set in production and change nothing when absent. Never secrets.
+TLS_FAIL_BACKUP_FILE="${TLS_FAIL_BACKUP_FILE:-/run/pgbouncer/.fail-tls-backup}"
+TLS_FAIL_ENDPOINT_FILE="${TLS_FAIL_ENDPOINT_FILE:-/run/pgbouncer/.fail-tls-endpoint-verification}"
+# Test-only install fault: while present, the installed key file receives
+# certificate content (unloadable as a private key), so a subsequent
+# RELOAD is really rejected by PgBouncer while the process survives.
+TLS_FAIL_INSTALL_FILE="${TLS_FAIL_INSTALL_FILE:-/run/pgbouncer/.fail-tls-install}"
 
 # Validate PUBLIC_HOST as a single DNS hostname.
 # Prints the sanitized value on success, returns 1 on failure.
@@ -221,7 +231,13 @@ install_runtime_cert() {
     rm -f "${_i_tmp_cert}" "${_i_tmp_key}" 2>/dev/null || true
     return 1
   fi
-  if ! cat "${_i_key}" > "${_i_tmp_key}" 2>/dev/null; then
+  # Test-only fault: install certificate content as the key so the pair
+  # is unloadable and a later RELOAD is rejected (process must survive).
+  _i_key_src="${_i_key}"
+  if [ -f "${TLS_FAIL_INSTALL_FILE}" ]; then
+    _i_key_src="${_i_cert}"
+  fi
+  if ! cat "${_i_key_src}" > "${_i_tmp_key}" 2>/dev/null; then
     rm -f "${_i_tmp_cert}" "${_i_tmp_key}" 2>/dev/null || true
     return 1
   fi
@@ -246,12 +262,22 @@ install_runtime_cert() {
 }
 
 # Save the current runtime pair as the previous known-good backup.
-# Best effort; failures are non-fatal for the caller to judge.
+# Callers must treat a nonzero return as fatal for the renewal attempt:
+# without a usable backup the active pair must not be touched. Backup
+# files are restrictive (0600) like the active copies.
 backup_runtime_cert() {
+  # Test-only fault flag for deterministic backup-failure tests.
+  if [ -f "${TLS_FAIL_BACKUP_FILE:-/run/pgbouncer/.fail-tls-backup}" ]; then
+    return 1
+  fi
   if [ -f "${TLS_RUNTIME_CERT}" ] && [ -f "${TLS_RUNTIME_KEY}" ]; then
     cp -f "${TLS_RUNTIME_CERT}" "${TLS_PREV_CERT}" 2>/dev/null || return 1
     cp -f "${TLS_RUNTIME_KEY}" "${TLS_PREV_KEY}" 2>/dev/null || return 1
     chmod 0600 "${TLS_PREV_CERT}" "${TLS_PREV_KEY}" 2>/dev/null || true
+    if id postgres >/dev/null 2>&1; then
+      chown postgres:postgres "${TLS_PREV_CERT}" "${TLS_PREV_KEY}" 2>/dev/null || true
+    fi
+    [ -s "${TLS_PREV_CERT}" ] && [ -s "${TLS_PREV_KEY}" ] || return 1
   fi
   return 0
 }
@@ -274,6 +300,16 @@ restore_runtime_cert_backup() {
 # Drop the previous-pair backup (fewer private-key copies on disk).
 clear_runtime_cert_backup() {
   rm -f "${TLS_PREV_CERT}" "${TLS_PREV_KEY}" 2>/dev/null || true
+  return 0
+}
+
+# Remove active and backup runtime pairs plus the applied record.
+# Used when starting (or restarting) with no usable source certificate
+# so a stale previously-applied version cannot suppress a future
+# activation of a reappearing certificate.
+clear_runtime_cert_files() {
+  rm -f "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" "${TLS_PREV_CERT}" "${TLS_PREV_KEY}" 2>/dev/null || true
+  clear_applied_fingerprint || true
   return 0
 }
 
@@ -349,4 +385,54 @@ verify_automatic_tls_config() {
     return 1
   fi
   return 0
+}
+
+# SHA-256 fingerprint of the leaf certificate in a local PEM file (reads
+# the first certificate block, i.e. the leaf of a fullchain file).
+# Prints bare uppercase hex without colons. No secrets, no keys.
+runtime_leaf_fingerprint() {
+  _l_file="${1:-${TLS_RUNTIME_CERT}}"
+  [ -r "${_l_file}" ] || return 1
+  _l_fp=""
+  _l_fp=$(openssl x509 -in "${_l_file}" -noout -fingerprint -sha256 2>/dev/null | sed -e 's/^[^=]*=//' | tr -d ':\n' | tr 'a-z' 'A-Z' 2>/dev/null) || return 1
+  [ -n "${_l_fp}" ] || return 1
+  printf '%s' "${_l_fp}"
+  return 0
+}
+
+# SHA-256 fingerprint of the leaf certificate currently served on the
+# PostgreSQL frontend port. Performs a real TLS handshake: PgBouncer
+# auto-detects a direct TLS ClientHello, so no PostgreSQL SSLRequest
+# framing is needed. Bounded by `timeout`, never blocks indefinitely.
+# Prints bare uppercase hex without colons. No credentials, no keys.
+served_frontend_leaf_fp() {
+  _s_port="${1:-5432}"
+  _s_name="${2:-localhost}"
+  _s_fp=""
+  _s_fp=$(timeout 10 openssl s_client -connect "127.0.0.1:${_s_port}" -servername "${_s_name}" -showcerts </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed -e 's/^[^=]*=//' | tr -d ':\n' | tr 'a-z' 'A-Z' 2>/dev/null) || return 1
+  [ -n "${_s_fp}" ] || return 1
+  printf '%s' "${_s_fp}"
+  return 0
+}
+
+# Externally verify that the frontend endpoint serves the expected
+# runtime leaf certificate. This is the only accepted proof that a TLS
+# activation (or renewal) actually took effect: a delivered SIGHUP plus
+# a live PID plus an open TCP port are NOT sufficient, because PgBouncer
+# keeps the previous TLS context when it rejects new TLS settings.
+# Args: [port] [servername]. No credentials, no private key material.
+# Test-only fault flag forces failure for deterministic retry tests.
+verify_frontend_tls_endpoint() {
+  if [ -f "${TLS_FAIL_ENDPOINT_FILE:-/run/pgbouncer/.fail-tls-endpoint-verification}" ]; then
+    return 1
+  fi
+  _e_port="${1:-${LISTEN_PORT:-5432}}"
+  _e_name="${2:-localhost}"
+  _e_expected=""
+  _e_expected=$(runtime_leaf_fingerprint "${TLS_RUNTIME_CERT}" 2>/dev/null) || return 1
+  [ -n "${_e_expected}" ] || return 1
+  _e_served=""
+  _e_served=$(served_frontend_leaf_fp "${_e_port}" "${_e_name}" 2>/dev/null) || return 1
+  [ -n "${_e_served}" ] || return 1
+  [ "${_e_served}" = "${_e_expected}" ]
 }

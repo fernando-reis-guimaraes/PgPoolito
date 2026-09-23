@@ -220,18 +220,34 @@ if [ -z "${TLS_APPLIED_FILE:-}" ]; then
 fi
 # Test-only fault-injection flags (runtime files, absent by default).
 # The test harness creates/removes them inside a running container to force
-# deterministic config-update or reload failures and verify fail-closed
-# retry behavior. They are never set in production and change nothing when
-# absent. Never contain secrets.
+# deterministic config-update, reload, backup, endpoint-verification, or
+# TLS-reload-rejection failures and verify fail-closed retry behavior.
+# They are never set in production and change nothing when absent.
+# Never contain secrets.
 TLS_FAIL_CONFIG_UPDATE_FILE="/run/pgbouncer/.fail-tls-config-update"
 TLS_FAIL_RELOAD_FILE="/run/pgbouncer/.fail-tls-reload"
+# TLS_FAIL_BACKUP_FILE / TLS_FAIL_ENDPOINT_FILE / TLS_FAIL_INSTALL_FILE
+# defaults live in lib/tls.sh (consumed there); TLS_FAIL_PROTOCOLS_FILE
+# is consumed below.
+TLS_FAIL_PROTOCOLS_FILE="/run/pgbouncer/.fail-tls-protocols"
+# Sentinel value injected into the rewritten config while the protocols
+# fault flag is present. PgBouncer 1.25.2 rejects it at RELOAD while
+# keeping the previous TLS context (verified live), which deterministically
+# simulates "SIGHUP delivered but TLS not applied". Stripped on every
+# rewrite and re-added only while the flag is present, so removing the
+# flag heals the config on the next poll.
+TLS_FAIL_PROTOCOLS_SENTINEL="bogusproto-pgpooler-test"
 HTTP_PORT="8080"
 WWW_DIR="/var/www"
 WWW_FILE="${WWW_DIR}/index.html"
 PGBOUNCER_PID_FILE="/run/pgbouncer/pgbouncer.pid"
 
-# Frontend TLS runtime state. One of: disabled, plaintext, active,
-# waiting, manual, manual-require. Also controls UI + healthcheck.
+# Frontend TLS runtime state. One of: disabled, plaintext, prepared,
+# waiting, active, manual, manual-require. Also controls UI + healthcheck.
+# `prepared` means the automatic certificate is installed and the config
+# is verified to require TLS, but the live endpoint has not been
+# externally verified yet. `active` additionally means the running
+# PgBouncer was externally verified to serve the expected certificate.
 FRONTEND_TLS_STATE="plaintext"
 FRONTEND_TLS_ACTIVE=0
 EXPECT_PGBOUNCER=1
@@ -487,8 +503,9 @@ print_config_redacted() {
 # --- Frontend TLS config helpers (automatic CapRover behavior) ---
 
 # Append the initial frontend TLS block during config generation.
-# Automatic active -> require + runtime paths. Manual -> preserved native
-# CLIENT_TLS_* lines. Otherwise explicit disable (equivalent to default).
+# Automatic prepared/active -> require + runtime paths. Manual ->
+# preserved native CLIENT_TLS_* lines. Otherwise explicit disable
+# (equivalent to default).
 write_frontend_tls_block() {
   if [ "${FRONTEND_TLS_ACTIVE}" = "1" ]; then
     printf 'client_tls_sslmode = require\n' >> "${PG_CONFIG_FILE}"
@@ -548,7 +565,8 @@ write_frontend_tls_block() {
 # Removes prior client_tls_sslmode/cert/key lines, appends require block.
 # Atomic via temp file + mv. Preserves all other settings. Keeps a
 # best-effort backup of the previous config for recoverability.
-# Honors the test-only fault flag to simulate a rewrite failure.
+# Honors the test-only fault flags to simulate a rewrite failure or a
+# PgBouncer-rejected TLS setting (sentinel protocols value).
 update_config_tls_to_require() {
   if [ -f "${TLS_FAIL_CONFIG_UPDATE_FILE:-/run/pgbouncer/.fail-tls-config-update}" ]; then
     return 1
@@ -558,7 +576,10 @@ update_config_tls_to_require() {
   cp -f "${PG_CONFIG_FILE}" "${PG_CONFIG_FILE}.prev" 2>/dev/null || true
   # Strip prior frontend identity lines (sslmode/cert/key only; keep
   # CA/protocols/ciphers extras which are re-appended from env below).
-  grep -v -E '^[[:space:]]*client_tls_(sslmode|cert_file|key_file)[[:space:]]*=' "${PG_CONFIG_FILE}" > "${_u_tmp}" 2>/dev/null || return 1
+  # The test-only rejected-protocols sentinel is always stripped here and
+  # re-added below only while its fault flag is present, so healing the
+  # flag heals the config on the next rewrite.
+  grep -v -E '^[[:space:]]*client_tls_(sslmode|cert_file|key_file)[[:space:]]*=' "${PG_CONFIG_FILE}" 2>/dev/null | grep -v -F "${TLS_FAIL_PROTOCOLS_SENTINEL:-bogusproto-pgpooler-test}" > "${_u_tmp}" 2>/dev/null || return 1
   {
     printf 'client_tls_sslmode = require\n'
     printf 'client_tls_cert_file = %s\n' "${TLS_RUNTIME_CERT}"
@@ -590,6 +611,11 @@ update_config_tls_to_require() {
       fi
     fi
   } >> "${_u_tmp}" || return 1
+  # Test-only rejected setting: deterministically rejected by PgBouncer at
+  # RELOAD while the previous TLS context is kept (verified live).
+  if [ -f "${TLS_FAIL_PROTOCOLS_FILE:-/run/pgbouncer/.fail-tls-protocols}" ]; then
+    printf 'client_tls_protocols = %s\n' "${TLS_FAIL_PROTOCOLS_SENTINEL:-bogusproto-pgpooler-test}" >> "${_u_tmp}" || return 1
+  fi
   chmod 0600 "${_u_tmp}" 2>/dev/null || true
   if [ "$(id -u 2>/dev/null || printf '0')" = "0" ] && id postgres >/dev/null 2>&1; then
     chown postgres:postgres "${_u_tmp}" 2>/dev/null || true
@@ -608,7 +634,7 @@ downgrade_config_tls_to_disable() {
   _d_tmp="${PG_CONFIG_FILE}.tls.tmp.$$"
   rm -f "${_d_tmp}" 2>/dev/null || true
   cp -f "${PG_CONFIG_FILE}" "${PG_CONFIG_FILE}.prev" 2>/dev/null || true
-  grep -v -E '^[[:space:]]*client_tls_(sslmode|cert_file|key_file)[[:space:]]*=' "${PG_CONFIG_FILE}" > "${_d_tmp}" 2>/dev/null || return 1
+  grep -v -E '^[[:space:]]*client_tls_(sslmode|cert_file|key_file)[[:space:]]*=' "${PG_CONFIG_FILE}" 2>/dev/null | grep -v -F "${TLS_FAIL_PROTOCOLS_SENTINEL:-bogusproto-pgpooler-test}" > "${_d_tmp}" 2>/dev/null || return 1
   printf 'client_tls_sslmode = disable\n' >> "${_d_tmp}" || return 1
   chmod 0600 "${_d_tmp}" 2>/dev/null || true
   if [ "$(id -u 2>/dev/null || printf '0')" = "0" ] && id postgres >/dev/null 2>&1; then
@@ -695,9 +721,28 @@ else
 fi
 
 # Detect a pre-existing custom config before we generate one.
+# A config carrying our generation marker is ours (e.g. left behind by a
+# normal `docker restart` of this same container filesystem) and is
+# regenerated deterministically below; only a file WITHOUT the marker
+# counts as a user custom/mounted config. A marker-owned file that cannot
+# be removed (e.g. a read-only single-file mount) cannot be regenerated,
+# so automatic TLS refuses it clearly instead of misbehaving.
+_GENERATED_MARKER="# Generated by PgPooler-Uma - do not edit inside the container"
 _CUSTOM_CONFIG=0
 if [ -f "${PG_CONFIG_FILE}" ]; then
-  _CUSTOM_CONFIG=1
+  if grep -q '^# Generated by PgPooler-Uma' "${PG_CONFIG_FILE}" 2>/dev/null; then
+    _CUSTOM_CONFIG=0
+    rm -f "${PG_CONFIG_FILE}" 2>/dev/null || true
+    if [ -f "${PG_CONFIG_FILE}" ]; then
+      if [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
+        echo "error: automatic CapRover TLS (PUBLIC_HOST=${PUBLIC_HOST_SANITIZED}) needs to regenerate ${PG_CONFIG_FILE}, but the owned file cannot be regenerated (read-only mount?). Mount the directory read-write, remove the mount, or unset PUBLIC_HOST to use manual CLIENT_TLS_* settings." >&2
+        exit 1
+      fi
+      _CUSTOM_CONFIG=1
+    fi
+  else
+    _CUSTOM_CONFIG=1
+  fi
 fi
 if [ "${_CUSTOM_CONFIG}" = "1" ] && [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
   echo "error: automatic CapRover TLS (PUBLIC_HOST=${PUBLIC_HOST_SANITIZED}) requires the generated pgbouncer.ini; a custom mounted config is present. Remove the custom mount to use automatic TLS, or unset PUBLIC_HOST to use manual CLIENT_TLS_* settings." >&2
@@ -706,10 +751,13 @@ fi
 
 # Initial automatic TLS bootstrap (privileged: reads read-only source tree,
 # validates with OpenSSL, installs private runtime copies). No secrets logged.
-# A successful install is still tentative: the version counts as applied
-# only after the generated config is verified below (fail-closed).
+# A successful install is still tentative: it publishes `prepared` (config
+# ready, endpoint not yet verified), never `active`. The version counts as
+# applied only after PgBouncer is started and the live endpoint is
+# externally verified below (fail-closed).
 _BOOT_TLS_CERT=""
 _BOOT_TLS_KEY=""
+_BOOT_PREPARED=0
 if [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
   _SRC_CERT="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/fullchain.pem"
   _SRC_KEY="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/privkey.pem"
@@ -717,10 +765,10 @@ if [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
     if validate_caprover_cert "${_SRC_CERT}" "${_SRC_KEY}" "${PUBLIC_HOST_SANITIZED}"; then
       if install_runtime_cert "${_SRC_CERT}" "${_SRC_KEY}"; then
         FRONTEND_TLS_ACTIVE=1
-        FRONTEND_TLS_STATE="active"
+        FRONTEND_TLS_STATE="prepared"
         _BOOT_TLS_CERT="${_SRC_CERT}"
         _BOOT_TLS_KEY="${_SRC_KEY}"
-        echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; frontend TLS is now required" >&2
+        echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; preparing frontend TLS" >&2
       else
         echo "TLS setup: failed to install runtime certificate for ${PUBLIC_HOST_SANITIZED}." >&2
         if [ "${PGPOOLER_SSL_MODE}" = "required" ]; then
@@ -732,6 +780,7 @@ if [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
         fi
       fi
     else
+      clear_runtime_cert_files || true
       if [ "${PGPOOLER_SSL_MODE}" = "required" ]; then
         FRONTEND_TLS_ACTIVE=0
         FRONTEND_TLS_STATE="waiting"
@@ -745,6 +794,7 @@ if [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
     fi
   else
     # Helper lib missing: cannot validate safely.
+    clear_runtime_cert_files || true
     if [ "${PGPOOLER_SSL_MODE}" = "required" ]; then
       FRONTEND_TLS_ACTIVE=0
       FRONTEND_TLS_STATE="waiting"
@@ -798,9 +848,10 @@ if [ ! -f "${PG_CONFIG_FILE}" ]; then
   # Lines starting with ";" or "#" are taken as comments and ignored.
   # The characters ";" and "#" are not recognized when they appear later in the line.
   printf "\
+%s\n\
 ################## Auto generated ##################
 [databases]
-" > "${PG_CONFIG_FILE}"
+" "${_GENERATED_MARKER}" > "${PG_CONFIG_FILE}"
 
   if [ -n "${DATABASE_URLS:-}" ]; then
     _urls_rest="${DATABASE_URLS},"
@@ -926,16 +977,19 @@ if [ -f "${TLS_RUNTIME_KEY}" ]; then
   chmod 0600 "${TLS_RUNTIME_KEY}" 2>/dev/null || true
 fi
 
-# Fail-closed confirmation for a tentative boot-time activation: the
+# Fail-closed confirmation for a tentative boot-time preparation: the
 # generated config must literally carry the automatic TLS identity before
-# the version counts as applied. Only then may PgBouncer start with it.
-if [ "${FRONTEND_TLS_ACTIVE}" = "1" ] && [ -n "${_BOOT_TLS_CERT}" ]; then
+# the container may proceed as `prepared`. The version counts as applied
+# only later, after PgBouncer is started and the live endpoint is
+# externally verified. Only then may state become `active`.
+if [ "${FRONTEND_TLS_STATE}" = "prepared" ] && [ -n "${_BOOT_TLS_CERT}" ]; then
   if command -v verify_automatic_tls_config >/dev/null 2>&1 && \
-     verify_automatic_tls_config "${PG_CONFIG_FILE}" "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null && \
-     commit_applied_fingerprint "${_BOOT_TLS_CERT}" "${_BOOT_TLS_KEY}" 2>/dev/null; then
-    :
+     verify_automatic_tls_config "${PG_CONFIG_FILE}" "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null; then
+    _BOOT_PREPARED=1
   else
-    echo "TLS setup: generated config failed verification for ${PUBLIC_HOST_SANITIZED}; not activating frontend TLS." >&2
+    echo "TLS setup: generated config failed verification for ${PUBLIC_HOST_SANITIZED}; not preparing frontend TLS." >&2
+    _BOOT_TLS_CERT=""
+    _BOOT_TLS_KEY=""
     if [ "${PGPOOLER_SSL_MODE}" = "required" ]; then
       FRONTEND_TLS_ACTIVE=0
       FRONTEND_TLS_STATE="waiting"
@@ -1106,14 +1160,19 @@ pgbouncer_tcp_ready() {
   return 1
 }
 
-# Confirm a freshly signaled or started PgBouncer survived the change.
-# Used after SIGHUP transitions and required-mode starts so `active` is
-# published only for a live process. No secrets, no authentication.
-confirm_pgbouncer_running() {
-  sleep 3 2>/dev/null || true
-  if pgbouncer_pid_alive && pgbouncer_tcp_ready; then
-    return 0
-  fi
+# Wait until the PgBouncer TCP port accepts connections (no login).
+# Used to give a freshly started process a moment before the endpoint
+# probe decides; waiting is not proof of anything.
+wait_pgbouncer_tcp() {
+  _wt_timeout="${1:-15}"
+  _wt_t=0
+  while [ "${_wt_t}" -lt "${_wt_timeout}" ]; do
+    if pgbouncer_tcp_ready; then
+      return 0
+    fi
+    sleep 1 2>/dev/null || true
+    _wt_t=$((_wt_t + 1))
+  done
   return 1
 }
 
@@ -1123,19 +1182,23 @@ confirm_pgbouncer_running() {
 # certs, applied fingerprint, state file, pid file) with the parent but
 # cannot set parent shell variables. All cross-process coordination uses
 # files. Fail-closed rules:
-#  - the applied fingerprint advances only after the full sequence for a
-#    version succeeds; any failure leaves it unchanged so the next poll
-#    retries the same source version;
-#  - TLS_STATE=active and the active UI are published only after success;
-#  - required waiting->active additionally requires config verification,
-#    and the parent re-verifies before starting PgBouncer and confirms the
-#    fresh process stays up;
+#  - the applied fingerprint advances only after the expected certificate
+#    is externally observed on the live endpoint; any failure leaves it
+#    unchanged so the next poll retries the same source version;
+#  - TLS_STATE=active and the active UI are published only after endpoint
+#    verification; `prepared` is published while activation is in flight;
+#  - a delivered SIGHUP plus a live PID plus an open TCP port are NOT
+#    success: only the served-certificate match counts, because PgBouncer
+#    keeps its previous TLS context when it rejects new TLS settings;
+#  - required waiting->prepared additionally requires config verification,
+#    and the parent re-verifies before starting PgBouncer and verifies the
+#    endpoint before publishing active;
 #  - a failed renewal keeps serving the previous known-good pair (runtime
 #    files restored, applied fingerprint untouched); active TLS is never
 #    downgraded to plaintext.
-# On required waiting->active: validate, install, rewrite config, verify,
-# commit applied, update state file; the parent supervisor starts PgBouncer
-# (no container restart).
+# On required waiting->prepared: validate, install, rewrite config,
+# verify; the parent supervisor starts PgBouncer and verifies the
+# endpoint (no container restart).
 cert_watcher() {
   # Only automatic candidates need a watcher. Disabled/manual/plaintext
   # without PUBLIC_HOST exits immediately (no polling, no busy loop).
@@ -1147,6 +1210,8 @@ cert_watcher() {
   fi
   _W_SRC_CERT="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/fullchain.pem"
   _W_SRC_KEY="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/privkey.pem"
+  _W_HOST="${PUBLIC_HOST_SANITIZED:-localhost}"
+  _W_PORT="${LISTEN_PORT:-5432}"
   # Subshell-local view of TLS state, seeded from the parent at fork and
   # kept in sync via the state file each iteration.
   _w_state="${FRONTEND_TLS_STATE}"
@@ -1161,7 +1226,11 @@ cert_watcher() {
       fi
     fi
     # Compare the source version against the last APPLIED version (not
-    # merely installed files) so failures automatically retry.
+    # merely installed files) so failures automatically retry. A state of
+    # `prepared` means the parent is driving activation; leave it alone.
+    if [ "${_w_state}" = "prepared" ]; then
+      continue
+    fi
     _w_src_fp=""
     if command -v source_fingerprint >/dev/null 2>&1; then
       _w_src_fp=$(source_fingerprint "${_W_SRC_CERT}" "${_W_SRC_KEY}" 2>/dev/null || printf '')
@@ -1189,14 +1258,20 @@ cert_watcher() {
     if [ "${_w_state}" = "active" ]; then
       # Renewal: same config paths, new contents take effect after RELOAD.
       # Existing client connections stay alive per PgBouncer semantics.
-      # Back up the known-good pair first so a failed reload restores it.
-      backup_runtime_cert || true
+      # The known-good backup is mandatory: without it the active pair
+      # must not be touched.
+      if ! backup_runtime_cert; then
+        echo "TLS setup: failed to back up current certificate for ${PUBLIC_HOST_SANITIZED}; leaving active pair untouched and retrying later." >&2
+        continue
+      fi
       if ! install_runtime_cert "${_W_SRC_CERT}" "${_W_SRC_KEY}"; then
         echo "TLS setup: failed to install renewed certificate for ${PUBLIC_HOST_SANITIZED}." >&2
         continue
       fi
       echo "Frontend TLS certificate changed; reloading PgBouncer" >&2
-      if reload_pgbouncer && confirm_pgbouncer_running; then
+      # The reload is processed asynchronously; pause briefly so the
+      # endpoint probe does not race the config switch.
+      if reload_pgbouncer && sleep 2 2>/dev/null && verify_frontend_tls_endpoint "${_W_PORT}" "${_W_HOST}"; then
         clear_runtime_cert_backup || true
         FRONTEND_TLS_STATE="active"
         FRONTEND_TLS_ACTIVE=1
@@ -1209,7 +1284,11 @@ cert_watcher() {
         fi
         _w_state="active"
       else
-        echo "TLS setup: failed to reload PgBouncer for ${PUBLIC_HOST_SANITIZED}; keeping previous certificate and retrying later." >&2
+        # Rejected reload (or failed endpoint): the running PgBouncer kept
+        # its previous in-memory TLS context, so restoring the previous
+        # files on disk reunites filesystem and process state with no
+        # further reload required.
+        echo "TLS setup: renewed certificate not served by PgBouncer for ${PUBLIC_HOST_SANITIZED}; restoring previous certificate and retrying later." >&2
         restore_runtime_cert_backup || true
         clear_runtime_cert_backup || true
       fi
@@ -1219,12 +1298,15 @@ cert_watcher() {
       # Dynamic prefer transition: plaintext -> require without restart.
       # The on-disk config may already carry require from a previous
       # failed attempt while the running process still serves plaintext;
-      # state stays plaintext until the reload is confirmed.
+      # state stays plaintext until the endpoint is verified. On failure
+      # the config is realigned back to disable (what is actually
+      # running) so disk and process agree.
       echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; applying frontend TLS" >&2
       if install_runtime_cert "${_W_SRC_CERT}" "${_W_SRC_KEY}" && \
          update_config_tls_to_require && \
          verify_automatic_tls_config "${PG_CONFIG_FILE}" "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null && \
-         reload_pgbouncer && confirm_pgbouncer_running; then
+         reload_pgbouncer && sleep 2 2>/dev/null && \
+         verify_frontend_tls_endpoint "${_W_PORT}" "${_W_HOST}"; then
         echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; frontend TLS is now required" >&2
         FRONTEND_TLS_ACTIVE=1
         FRONTEND_TLS_STATE="active"
@@ -1239,33 +1321,26 @@ cert_watcher() {
         _w_state="active"
       else
         echo "TLS setup: failed to apply frontend TLS for ${PUBLIC_HOST_SANITIZED}; staying on plaintext and retrying later." >&2
+        downgrade_config_tls_to_disable || true
       fi
       continue
     fi
     if [ "${_w_state}" = "waiting" ] && [ "${_w_mode}" = "required" ]; then
       # Required bootstrap: certificate arrived. Fail closed: every step
-      # must succeed before signaling the parent to start PgBouncer.
+      # must succeed before signaling the parent, which starts PgBouncer
+      # and verifies the endpoint before publishing `active`.
       echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; preparing frontend TLS" >&2
       if install_runtime_cert "${_W_SRC_CERT}" "${_W_SRC_KEY}" && \
          update_config_tls_to_require && \
          verify_automatic_tls_config "${PG_CONFIG_FILE}" "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null; then
-        echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; frontend TLS is now required" >&2
+        echo "Valid certificate detected for ${PUBLIC_HOST_SANITIZED}; frontend TLS prepared, waiting for process verification" >&2
         FRONTEND_TLS_ACTIVE=1
-        FRONTEND_TLS_STATE="active"
+        FRONTEND_TLS_STATE="prepared"
         EXPECT_PGBOUNCER=1
         write_state_file || true
         render_ui || true
         print_config_redacted >/dev/null 2>&1 || true
-        if ! commit_applied_fingerprint "${_W_SRC_CERT}" "${_W_SRC_KEY}"; then
-          echo "TLS setup: failed to record applied certificate for ${PUBLIC_HOST_SANITIZED}; will retry." >&2
-          FRONTEND_TLS_ACTIVE=0
-          FRONTEND_TLS_STATE="waiting"
-          EXPECT_PGBOUNCER=0
-          write_state_file || true
-          render_ui || true
-          continue
-        fi
-        _w_state="active"
+        _w_state="prepared"
       else
         echo "TLS setup: failed to prepare frontend TLS for ${PUBLIC_HOST_SANITIZED}; still waiting and retrying later." >&2
       fi
@@ -1274,43 +1349,44 @@ cert_watcher() {
   done
 }
 
-# Boot supervised children.
-start_httpd
+# Publish a fully verified automatic activation as `active`.
+# Call only after the live endpoint was externally verified to serve the
+# expected certificate. Sets caller-shell state, writes state file + UI,
+# then records the applied fingerprint last so an interruption retries
+# instead of skipping. Args: src_cert src_key. Returns nonzero when the
+# applied fingerprint cannot be recorded.
+publish_tls_active() {
+  _p_cert="$1"; _p_key="$2"
+  FRONTEND_TLS_ACTIVE=1
+  FRONTEND_TLS_STATE="active"
+  EXPECT_PGBOUNCER=1
+  write_state_file || return 1
+  render_ui || true
+  print_config_redacted >/dev/null 2>&1 || true
+  commit_applied_fingerprint "${_p_cert}" "${_p_key}" || return 1
+  return 0
+}
 
-if [ "${EXPECT_PGBOUNCER}" = "1" ]; then
-  # shellcheck disable=SC2086
-  start_pgbouncer "$@"
-else
-  echo "Frontend TLS policy requires a certificate; waiting before starting PgBouncer" >&2
-  echo "HTTP documentation UI remains available on port ${HTTP_PORT}." >&2
-fi
+# Revert a prepared automatic activation back to waiting (required).
+# Used when verification or process confirmation fails and no PgBouncer
+# is running (or after it was stopped). Clears the applied fingerprint
+# so the watcher retries the same source version on its next poll.
+revert_prepared_to_waiting() {
+  FRONTEND_TLS_ACTIVE=0
+  FRONTEND_TLS_STATE="waiting"
+  EXPECT_PGBOUNCER=0
+  clear_applied_fingerprint || true
+  write_state_file || true
+  render_ui || true
+}
 
-# Watcher runs in background only when automatic discovery is relevant.
-if [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
-  cert_watcher &
-  WATCHER_PID="$!"
-fi
-
-# Supervise: exit when any essential child exits. Waiting mode has no
-# PgBouncer yet; watch httpd + watcher instead.
-if [ "${EXPECT_PGBOUNCER}" = "1" ]; then
-  # Wait for PgBouncer; forward httpd/watcher cleanup on its exit.
-  wait "${PGBOUNCER_PID}" 2>/dev/null || _pgb_status=$?
-  _pgb_status=${_pgb_status:-0}
-  if [ "${_SHUTDOWN}" != "1" ]; then
-    echo "PgBouncer exited (status ${_pgb_status}); shutting down." >&2
-    _SHUTDOWN=1
-    cleanup_children TERM
-  fi
-  wait 2>/dev/null || true
-  rm -f "${PGBOUNCER_PID_FILE}" 2>/dev/null || true
-  exit "${_pgb_status}"
-else
-  # Waiting mode: keep UI + watcher alive until terminated or cert arrives.
-  # The watcher prepares the verified require config and signals via the
-  # state file; the parent re-verifies the config itself before starting
-  # PgBouncer and confirms the fresh process stays up. A failed start
-  # reverts to waiting so the service is never misrepresented as active.
+# Waiting supervision: HTTP UI + watcher stay alive with no PostgreSQL
+# listener. When the watcher signals `prepared`, re-verify the config,
+# start PgBouncer, verify the live endpoint serves the expected
+# certificate, and only then publish `active`. Any failure reverts to
+# waiting (fail closed) and the watcher retries; the listener is never
+# exposed without confirmed TLS.
+supervise_waiting() {
   while [ "${_SHUTDOWN}" != "1" ]; do
     if [ -n "${PGBOUNCER_PID}" ]; then
       wait "${PGBOUNCER_PID}" 2>/dev/null || _pgb_status=$?
@@ -1331,42 +1407,36 @@ else
       case "${_exp}" in
         EXPECT_PGBOUNCER=1)
           case "${_st}" in
-            TLS_STATE=active)
+            TLS_STATE=prepared)
               if [ -z "${PGBOUNCER_PID}" ]; then
+                _sw_cert="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/fullchain.pem"
+                _sw_key="${CAPROVER_BASE}/live/${PUBLIC_HOST_SANITIZED}/privkey.pem"
                 # The state file alone is not proof: re-verify the require
                 # config before exposing the PostgreSQL listener.
                 if ! command -v verify_automatic_tls_config >/dev/null 2>&1 || \
                    ! verify_automatic_tls_config "${PG_CONFIG_FILE}" "${TLS_RUNTIME_CERT}" "${TLS_RUNTIME_KEY}" 2>/dev/null; then
-                  echo "TLS setup: signaled activation failed parent verification; reverting to waiting." >&2
-                  FRONTEND_TLS_STATE="waiting"
-                  FRONTEND_TLS_ACTIVE=0
-                  EXPECT_PGBOUNCER=0
-                  clear_applied_fingerprint || true
-                  write_state_file || true
-                  render_ui || true
+                  echo "TLS setup: signaled preparation failed parent verification; reverting to waiting." >&2
+                  revert_prepared_to_waiting
                   continue
                 fi
-                FRONTEND_TLS_STATE="active"
+                FRONTEND_TLS_STATE="prepared"
                 FRONTEND_TLS_ACTIVE=1
                 EXPECT_PGBOUNCER=1
                 start_pgbouncer "$@"
-                if confirm_pgbouncer_running; then
-                  echo "PgBouncer started with frontend TLS required." >&2
+                if wait_pgbouncer_tcp 15 && \
+                   verify_frontend_tls_endpoint "${LISTEN_PORT:-5432}" "${PUBLIC_HOST_SANITIZED:-localhost}" && \
+                   publish_tls_active "${_sw_cert}" "${_sw_key}"; then
+                  echo "PgBouncer started with frontend TLS verified active." >&2
                 else
-                  echo "TLS setup: PgBouncer did not stay running with the prepared TLS config; reverting to waiting." >&2
-                  FRONTEND_TLS_STATE="waiting"
-                  FRONTEND_TLS_ACTIVE=0
-                  EXPECT_PGBOUNCER=0
+                  echo "TLS setup: prepared endpoint did not verify live; reverting to waiting." >&2
+                  kill "${PGBOUNCER_PID}" 2>/dev/null || true
+                  wait "${PGBOUNCER_PID}" 2>/dev/null || true
                   PGBOUNCER_PID=""
                   rm -f "${PGBOUNCER_PID_FILE}" 2>/dev/null || true
-                  clear_applied_fingerprint || true
-                  write_state_file || true
-                  render_ui || true
-                  cleanup_children TERM
-                  wait 2>/dev/null || true
-                  exit 1
+                  revert_prepared_to_waiting
+                  continue
                 fi
-                # Now supervise the newly started PgBouncer below.
+                # Now supervise the verified PgBouncer below.
                 wait "${PGBOUNCER_PID}" 2>/dev/null || _pgb_status=$?
                 _pgb_status=${_pgb_status:-0}
                 if [ "${_SHUTDOWN}" != "1" ]; then
@@ -1377,6 +1447,18 @@ else
                 wait 2>/dev/null || true
                 rm -f "${PGBOUNCER_PID_FILE}" 2>/dev/null || true
                 exit "${_pgb_status}"
+              fi
+              ;;
+            TLS_STATE=active)
+              # Unreachable in normal operation: `active` is published only
+              # after a verified start that also records the child pid.
+              # Trip fail-closed rather than guessing.
+              if [ -z "${PGBOUNCER_PID}" ]; then
+                echo "TLS setup: unexpected active state with no supervised PgBouncer; shutting down." >&2
+                _SHUTDOWN=1
+                cleanup_children TERM
+                wait 2>/dev/null || true
+                exit 1
               fi
               ;;
           esac
@@ -1396,4 +1478,70 @@ else
   done
   wait 2>/dev/null || true
   exit 0
+}
+
+# Boot supervised children.
+start_httpd
+
+if [ "${EXPECT_PGBOUNCER}" = "1" ]; then
+  # shellcheck disable=SC2086
+  start_pgbouncer "$@"
+  if [ "${_BOOT_PREPARED:-0}" = "1" ]; then
+    # Boot-time prepared activation: the endpoint must be externally
+    # verified before `active` may be published (same rule as late
+    # activation). Applied is committed only on success.
+    if wait_pgbouncer_tcp 15 && \
+       verify_frontend_tls_endpoint "${LISTEN_PORT:-5432}" "${PUBLIC_HOST_SANITIZED:-localhost}" && \
+       publish_tls_active "${_BOOT_TLS_CERT}" "${_BOOT_TLS_KEY}"; then
+      echo "Frontend TLS verified active for ${PUBLIC_HOST_SANITIZED}." >&2
+    else
+      echo "TLS setup: boot-time prepared endpoint did not verify live." >&2
+      kill "${PGBOUNCER_PID}" 2>/dev/null || true
+      wait "${PGBOUNCER_PID}" 2>/dev/null || true
+      PGBOUNCER_PID=""
+      rm -f "${PGBOUNCER_PID_FILE}" 2>/dev/null || true
+      if [ "${PGPOOLER_SSL_MODE}" = "required" ]; then
+        revert_prepared_to_waiting
+      else
+        # Prefer falls back to what is actually running: plaintext.
+        downgrade_config_tls_to_disable || true
+        FRONTEND_TLS_ACTIVE=0
+        FRONTEND_TLS_STATE="plaintext"
+        EXPECT_PGBOUNCER=1
+        write_state_file || true
+        render_ui || true
+        # shellcheck disable=SC2086
+        start_pgbouncer "$@"
+      fi
+    fi
+  fi
+else
+  echo "Frontend TLS policy requires a certificate; waiting before starting PgBouncer" >&2
+  echo "HTTP documentation UI remains available on port ${HTTP_PORT}." >&2
+fi
+
+# Watcher runs in background only when automatic discovery is relevant.
+# Forked after the initial start so a boot-time prepared endpoint is
+# verified by the parent first; the watcher skips `prepared` states.
+if [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
+  cert_watcher &
+  WATCHER_PID="$!"
+fi
+
+# Supervise: exit when any essential child exits. A boot-time required
+# failure already reverted to waiting above; enter waiting supervision.
+if [ "${EXPECT_PGBOUNCER}" = "1" ]; then
+  # Wait for PgBouncer; forward httpd/watcher cleanup on its exit.
+  wait "${PGBOUNCER_PID}" 2>/dev/null || _pgb_status=$?
+  _pgb_status=${_pgb_status:-0}
+  if [ "${_SHUTDOWN}" != "1" ]; then
+    echo "PgBouncer exited (status ${_pgb_status}); shutting down." >&2
+    _SHUTDOWN=1
+    cleanup_children TERM
+  fi
+  wait 2>/dev/null || true
+  rm -f "${PGBOUNCER_PID_FILE}" 2>/dev/null || true
+  exit "${_pgb_status}"
+else
+  supervise_waiting "$@"
 fi

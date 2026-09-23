@@ -20,6 +20,7 @@ tls_display_string() {
     plaintext) printf 'Not available - plaintext currently enabled' ;;
     active) printf 'Available and required' ;;
     waiting) printf 'Required - waiting for certificate' ;;
+    prepared) printf 'Preparing secure PostgreSQL endpoint' ;;
     manual-require) printf 'Available and required (manual configuration)' ;;
     manual) printf 'Enabled (manual configuration)' ;;
     *) printf 'Not available - plaintext currently enabled' ;;
@@ -27,10 +28,11 @@ tls_display_string() {
 }
 
 # Connection sslmode hint for the displayed example.
-# Only advertise verify-full when TLS is actively required.
+# verify-full is shown for waiting/prepared only as the future string for
+# an endpoint that is explicitly marked not yet available (see note below).
 ui_sslmode_for_state() {
   case "$1" in
-    active|waiting|manual-require) printf 'verify-full' ;;
+    active|waiting|prepared|manual-require) printf 'verify-full' ;;
     manual) printf '%s' "${2:-disable}" ;;
     *) printf 'disable' ;;
   esac
@@ -78,9 +80,17 @@ generate_ui_page() {
   fi
 
   # TLS note: recommend verify-full only when TLS is active/required.
+  # waiting/prepared show the future string but explicitly mark the
+  # endpoint as not yet available so it is never presented as usable.
   case "${_u_state}" in
-    active|waiting|manual-require)
+    active|manual-require)
       _u_tls_note="<p class=\"note\">Use hostname verification on the client, for example <code>sslmode=verify-full</code>.</p>"
+      ;;
+    prepared)
+      _u_tls_note="<p class=\"note\">The secure PostgreSQL endpoint is being prepared and is not yet available. Once ready, use hostname verification, for example <code>sslmode=verify-full</code>.</p>"
+      ;;
+    waiting)
+      _u_tls_note="<p class=\"note\">The secure PostgreSQL endpoint is not yet available; waiting for a certificate. Once ready, use hostname verification, for example <code>sslmode=verify-full</code>.</p>"
       ;;
     *)
       _u_tls_note="<p class=\"note\">TLS is not currently active for PostgreSQL connections. The example below uses <code>sslmode=disable</code>.</p>"

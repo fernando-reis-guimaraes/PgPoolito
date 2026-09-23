@@ -220,10 +220,14 @@ Disabled
 Not available - plaintext currently enabled
 Available and required
 Required - waiting for certificate
+Preparing secure PostgreSQL endpoint
 ```
 
-When TLS is active the page recommends `sslmode=verify-full`. When no
-certificate is active it shows `sslmode=disable` and never misleads with
+When TLS is active the page recommends `sslmode=verify-full`. The
+`Preparing` and `Required - waiting` states show the future
+`verify-full` connection string only together with an explicit
+not-yet-available note, never as currently usable. When no certificate
+is active the page shows `sslmode=disable` and never misleads with
 `verify-full`. When `PUBLIC_HOST` is absent the page derives the display
 host from the browser request hostname (`window.location.hostname`);
 automatic certificate selection never guesses in that case.
@@ -281,23 +285,32 @@ equivalent to PgBouncer native `client_tls_sslmode=prefer`.
 
 * `prefer`: operate without TLS only while TLS is unavailable; once a
   valid certificate is available, require TLS. Without a certificate
-  PgBouncer starts plaintext. With a valid certificate PgBouncer uses
-  `client_tls_sslmode = require` and plaintext is rejected. If a
-  certificate appears later (for example after enabling HTTPS in
-  CapRover) it is detected automatically, installed, and PgBouncer is
-  switched to `require` without restarting the container. This does NOT
+  PgBouncer starts plaintext. With a valid certificate the config is
+  verified to require TLS, the endpoint is probed to actually serve the
+  expected certificate, and only then is the state published as `active`
+  (via an intermediate `prepared` state). Plaintext is rejected from that
+  point on. If a certificate appears later (for example after enabling
+  HTTPS in CapRover) it is detected automatically, installed, and
+  PgBouncer is switched to `require` without restarting the container,
+  again only after the live endpoint proves the switch. This does NOT
   mean native `prefer` (which would keep accepting plaintext).
 
 * `required`: frontend TLS is mandatory. Without a valid certificate the
   HTTP UI still runs but PgBouncer does not expose a PostgreSQL
   listener; plaintext is never temporarily exposed. The container stays
   stable (not crash-looping) and logs that it is waiting. When a valid
-  certificate appears it is prepared automatically, PgBouncer starts
-  with `client_tls_sslmode = require`, and the first PostgreSQL
-  connection already requires TLS. There is no plaintext window.
+  certificate appears it is installed, the config is rewritten and
+  verified, and the state becomes `prepared`; the parent then starts
+  PgBouncer and externally verifies the live endpoint serves the
+  expected certificate before publishing `active`. Only then does the
+  first PostgreSQL connection succeed, already requiring TLS. There is
+  no plaintext window.
 
-Once automatic TLS is active, both `prefer` and `required` result in
-native `client_tls_sslmode = require`.
+Once automatic TLS is externally verified live, both `prefer` and
+`required` result in native `client_tls_sslmode = require`. `active`
+always means a running PgBouncer endpoint was verified to serve the
+expected certificate; a delivered `SIGHUP`, a live PID, or an open TCP
+port alone never counts as success.
 
 ### Frontend vs backend TLS
 
@@ -351,7 +364,9 @@ prefer + neither
 
 required + PUBLIC_HOST
   automatic TLS, strictly fail-closed (waiting with UI only until a
-  valid cert is verified, installed, and confirmed in the config)
+  valid cert is verified, installed, and confirmed in the config;
+  prepared until the endpoint is externally verified live; active
+  only after the served certificate matches)
 
 required + no PUBLIC_HOST + valid manual CLIENT_TLS_* (require+)
   manual required TLS
@@ -380,6 +395,19 @@ log reason; in `required` mode PostgreSQL stays unavailable while
 waiting. An active TLS state is never automatically downgraded to
 plaintext.
 
+### Endpoint verification
+
+`active` is published only after a real TLS handshake against the
+frontend port proves PgBouncer serves the expected leaf certificate
+(SHA-256 X.509 fingerprint of the served chain head compared with the
+runtime leaf; bounded by `timeout`, no database credentials, no private
+keys). A delivered `SIGHUP`, a live PID, or an open TCP port alone never
+counts: PgBouncer keeps its previous TLS context when it rejects new TLS
+settings (verified live against 1.25.2), so only the served-certificate
+match gates activation, transition, and renewal. Plaintext rejection
+(`sslmode=disable` fails) is additionally asserted by live tests using
+real frontend credentials.
+
 ### Runtime copies and renewal
 
 Source files stay untouched. Validated certificates are copied to a
@@ -399,44 +427,76 @@ symlinks) against the last **applied** fingerprint to detect initial
 appearance and renewal without container restarts, Certbot hooks, or
 inotify.
 
-Applied means confirmed live, not merely copied: the applied fingerprint
-advances only after the full sequence succeeds (validate, install,
-rewrite config, verify the config literally carries
-`client_tls_sslmode = require` with the exact runtime cert/key paths,
-deliver `SIGHUP`, confirm the process survived). Any failure leaves the
-applied fingerprint unchanged so the next poll retries the same source
-version; state and UI are never published as `active` speculatively.
+Applied means externally verified live, not merely copied: the applied
+fingerprint advances only after the expected leaf certificate is
+observed on the live endpoint via a real TLS handshake
+(`openssl s_client` against the frontend port, SHA-256 X.509 fingerprint
+compared with the runtime leaf; bounded by `timeout`, no credentials, no
+keys). A delivered `SIGHUP`, a live PID, or an open TCP port alone never
+advances it: PgBouncer keeps its previous TLS context when it rejects
+new TLS settings, so only the served-certificate match counts. Any
+failure leaves the applied fingerprint unchanged so the next poll
+retries the same source version; state and UI are never published as
+`active` speculatively.
 On renewal the new pair is validated first, the previous known-good pair
-is backed up, files are atomically installed, and PgBouncer is reloaded
-with `SIGHUP` (`RELOAD`); a failed reload restores the previous files,
+is backed up (renewal aborts before touching the active pair if the
+backup cannot be created), files are atomically installed, PgBouncer is
+reloaded with `SIGHUP` (`RELOAD`), and the endpoint must then serve the
+new leaf; a failed reload restores the previous files (no further reload
+needed, since the running process kept the previous in-memory context),
 keeps serving the old certificate, and retries later. Active TLS is
 never automatically downgraded to plaintext. Existing client connections
 stay alive per PgBouncer semantics and new TLS handshakes receive the
 renewed certificate. Changing TLS settings triggers an automatic
 server-side `RECONNECT`; verified live against PgBouncer 1.25.2 that
 `disable -> require` applies via `SIGHUP` with new plaintext rejected
-and no container restart.
+and no container restart, and that a rejected TLS reload keeps the old
+context while the process stays alive.
 
-Required mode is strictly fail-closed: `waiting -> active` happens only
-after a valid source pair is installed, the rewritten config is verified
-to contain the require identity, and (for the late start) the parent
-re-verifies the config before starting PgBouncer and confirms the fresh
-process stays listening. Otherwise the PostgreSQL listener stays down,
-state remains `waiting` with `EXPECT_PGBOUNCER=0`, and the watcher
-retries. There is no code path that starts PgBouncer from a failed
-config rewrite merely because the config file exists.
+Required mode is strictly fail-closed: `waiting -> prepared` happens
+only after a valid source pair is installed and the rewritten config is
+verified to contain the require identity. `prepared -> active` happens
+only after the parent re-verifies the config, starts PgBouncer, and the
+live endpoint is verified to serve the expected certificate. Otherwise
+the PostgreSQL listener stays down, state returns to (or remains)
+`waiting` with `EXPECT_PGBOUNCER=0`, and the watcher retries. There is
+no code path that starts PgBouncer from a failed config rewrite merely
+because the config file exists, and no code path that publishes `active`
+from a delivered `SIGHUP` alone.
 
 State invariants (also reflected by the UI and the healthcheck):
 
 ```text
 plaintext: the running PgBouncer intentionally accepts plaintext.
-active:    the running PgBouncer has require plus a valid certificate
-           successfully applied; never set speculatively.
+prepared:  automatic cert installed and require config verified, but the
+           live endpoint has not been externally verified yet; PgBouncer
+           may be starting or a reload may be in flight. UI shows
+           "Preparing secure PostgreSQL endpoint" with the future
+           connection string marked not yet available.
+active:    a running PgBouncer endpoint was externally verified to serve
+           the expected certificate; never set speculatively. The applied
+           fingerprint then equals that verified version.
 waiting + EXPECT_PGBOUNCER=0: TLS is mandatory but not safely available;
            no PgBouncer listener exists.
 disabled:  explicitly no frontend TLS (manual TLS rejected).
 manual/manual-require: native manual CLIENT_TLS_* behavior as configured.
 ```
+
+### Generated config ownership and restart
+
+The generated `pgbouncer.ini` starts with an explicit ownership marker:
+
+```text
+# Generated by PgPooler-Uma - do not edit inside the container
+```
+
+On startup, a config file carrying this marker is recognized as our own
+(e.g. left behind by a normal `docker restart` of the same container)
+and regenerated deterministically; only a file without the marker counts
+as a user custom/mounted config (automatic TLS still rejects a genuine
+custom config with a clear error when dynamic rewriting is unsupported).
+Restarting a container therefore recovers cleanly with automatic TLS
+intact and without duplicating auth entries.
 
 ### Production example
 
@@ -509,11 +569,13 @@ be combined with manual frontend TLS settings.
 ### Healthcheck
 
 No `pg_isready` login and no credential noise. The check verifies the
-HTTP UI on `8080` and, when PgBouncer is expected to run, TCP liveness
-on `LISTEN_PORT` via `nc -z` (no PostgreSQL handshake). In
-`required` waiting state UI availability alone is healthy; the container
-is not marked broken while CapRover has not issued the first
-certificate.
+HTTP UI on `8080` and, when PgBouncer is expected to run with a settled
+state, TCP liveness on `LISTEN_PORT` via `nc -z` (no PostgreSQL
+handshake). In `required` waiting state UI availability alone is
+healthy; the container is not marked broken while CapRover has not
+issued the first certificate. The transitional `prepared` state is
+likewise UI-only healthy so a normal activation never trips a restart
+loop; a failed activation reverts to `waiting`.
 
 ## Tracking upstream
 

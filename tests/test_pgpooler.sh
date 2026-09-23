@@ -1004,7 +1004,14 @@ docker run -d --name "pgpooler-prefer-tls-${SUFFIX}" --network "${NET}" \
   -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
   -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
   "${IMAGE}" >/dev/null
-sleep 5
+# Boot-time activation verifies the live endpoint before publishing
+# active, so wait for the state rather than assuming a fixed delay.
+if wait_tls_state "pgpooler-prefer-tls-${SUFFIX}" "active" 30; then
+  pass "prefer with cert reaches verified active state"
+else
+  fail "prefer with cert did not reach active state"
+  docker logs "pgpooler-prefer-tls-${SUFFIX}" 2>&1 | head -20 || true
+fi
 if docker exec "pgpooler-prefer-tls-${SUFFIX}" grep -q "client_tls_sslmode = require" /etc/pgbouncer/pgbouncer.ini 2>/dev/null; then
   pass "prefer with cert uses native require"
 else
@@ -1206,7 +1213,11 @@ docker run -d --name "pgpooler-renewal-${SUFFIX}" --network "${NET}" \
   -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
   -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
   "${IMAGE}" >/dev/null
-sleep 6
+if wait_tls_state "pgpooler-renewal-${SUFFIX}" "active" 30; then
+  pass "renewal: boot reaches verified active state (cert A)"
+else
+  fail "renewal: boot did not reach active state"
+fi
 if tls_require_connect "${P6_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
   pass "renewal: initial TLS works (cert A)"
 else
@@ -1602,16 +1613,24 @@ fi
 docker rm -f "pgpooler-manual-tls-${SUFFIX}" >/dev/null 2>&1 || true
 
 # ================================================== Fault-injection (F)
-# Deterministic fail-closed regression tests. The image supports two
+# Deterministic fail-closed regression tests. The image supports
 # test-only runtime fault flags (plain files, absent by default, never
 # secrets) that the test harness creates/removes inside a running
 # container; production behavior is unchanged when they are absent:
 #   /run/pgbouncer/.fail-tls-config-update -> config rewrite fails
 #   /run/pgbouncer/.fail-tls-reload        -> SIGHUP/reload fails
+#   /run/pgbouncer/.fail-tls-backup        -> renewal backup fails
+#   /run/pgbouncer/.fail-tls-endpoint-verification -> endpoint probe fails
+#   /run/pgbouncer/.fail-tls-protocols     -> rewritten config carries a
+#     TLS setting PgBouncer rejects at RELOAD while keeping the previous
+#     TLS context (proves SIGHUP-delivered-but-not-applied handling)
+#   /run/pgbouncer/.fail-tls-install       -> installed key is unloadable
+#     (certificate content), so a renewal RELOAD is really rejected while
+#     the process survives with the previous context
 # Applied-fingerprint semantics under test:
-#   applied = source version confirmed live (config verified + reload
-#   delivered to a surviving process, or verified fresh start). Any
-#   failure leaves it unchanged so the next poll retries the same source.
+#   applied = source version confirmed live (config verified + expected
+#   certificate externally observed on the endpoint). Any failure leaves
+#   it unchanged so the next poll retries the same source.
 
 # Read the applied fingerprint recorded inside a container (may be empty).
 read_applied_fp() {
@@ -1831,7 +1850,11 @@ docker run -d --name "pgpooler-f3-renew-${SUFFIX}" --network "${NET}" \
   -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
   -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
   "${IMAGE}" >/dev/null
-sleep 6
+if wait_tls_state "pgpooler-f3-renew-${SUFFIX}" "active" 30; then
+  pass "F3: boot reaches verified active state (cert A)"
+else
+  fail "F3: boot did not reach active state"
+fi
 if tls_require_connect "${F3_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
   pass "F3: initial TLS works (cert A)"
 else
@@ -2050,6 +2073,763 @@ else
     fail "F6: bogus sslmode rejected without clear error"
   fi
 fi
+
+# ================================================== Endpoint-verified TLS (G)
+# These tests prove the served certificate identity (not PID/TCP/config
+# text) gates every `active` publication and every applied-fingerprint
+# advance, plus restart-safe generated-config ownership.
+# Helpers: served leaf via direct TLS handshake (tls_fingerprint), runtime
+# leaf read inside the container in the identical openssl format.
+
+# Leaf fingerprint of the installed runtime cert (openssl x509 format,
+# directly comparable with tls_fingerprint output).
+runtime_leaf_fp_now() {
+  docker exec "$1" openssl x509 -in /run/pgbouncer/tls/fullchain.pem -noout -fingerprint -sha256 2>/dev/null | tr -d '\n' || printf ''
+}
+# Single-read TLS_STATE (may be empty).
+read_tls_state_now() {
+  docker exec "$1" cat /run/pgbouncer/pgpooler.state 2>/dev/null | grep '^TLS_STATE=' | cut -d= -f2- || printf ''
+}
+# Runtime fullchain content hash (proves restore/untouched identity).
+runtime_file_hash_now() {
+  docker exec "$1" sh -c 'sha256sum /run/pgbouncer/tls/fullchain.pem 2>/dev/null | awk "{print \$1}"' 2>/dev/null || printf ''
+}
+
+log "--- Test G1: required publishes prepared, never active, before endpoint verification ---"
+TLS_G1_DIR="${TLS_BASE}/g1"
+TLS_G1_TREE="${TLS_BASE}/g1-tree"
+G1_PORT=16448
+G1_UI=18048
+mkdir -p "${TLS_G1_TREE}/live/localhost" 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_G1_DIR}"; then
+  pass "G1 cert generated (not yet installed)"
+else
+  fail "G1 cert generation failed"
+fi
+docker run -d --name "pgpooler-g1-req-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${G1_PORT}:6432" -p "127.0.0.1:${G1_UI}:8080" \
+  -v "${TLS_G1_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=required -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_tls_state "pgpooler-g1-req-${SUFFIX}" "waiting" 15; then
+  pass "G1: initial waiting state"
+else
+  fail "G1: did not reach waiting state"
+fi
+# Fail endpoint verification: prepared must appear, active must not.
+docker exec "pgpooler-g1-req-${SUFFIX}" touch /run/pgbouncer/.fail-tls-endpoint-verification 2>/dev/null || true
+install_test_cert "${TLS_G1_DIR}" "${TLS_G1_TREE}" "localhost" || true
+_G1_SAW_PREPARED=0
+_G1_SAW_ACTIVE=0
+_i=0
+while [ "${_i}" -lt 40 ]; do
+  _st=$(read_tls_state_now "pgpooler-g1-req-${SUFFIX}")
+  case "${_st}" in
+    active) _G1_SAW_ACTIVE=1; break ;;
+    prepared) _G1_SAW_PREPARED=1 ;;
+  esac
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_G1_SAW_ACTIVE}" = "0" ]; then
+  pass "G1: active never published before endpoint verification"
+else
+  fail "G1: active must never appear before verification"
+fi
+if [ "${_G1_SAW_PREPARED}" = "1" ]; then
+  pass "G1: prepared published while activation in flight"
+else
+  fail "G1: prepared state was never observed"
+fi
+_G1_APPLIED=$(read_applied_fp "pgpooler-g1-req-${SUFFIX}")
+if [ -z "${_G1_APPLIED}" ]; then
+  pass "G1: applied fingerprint empty until verification"
+else
+  fail "G1: applied fingerprint must not advance before verification"
+fi
+if fetch_ui "${G1_UI}" "/tmp/pgpooler-g1-ui-${SUFFIX}.html"; then
+  if grep -q "Available and required" "/tmp/pgpooler-g1-ui-${SUFFIX}.html" 2>/dev/null; then
+    fail "G1: UI must not claim active before verification"
+  else
+    pass "G1: UI never claims active before verification"
+  fi
+  rm -f "/tmp/pgpooler-g1-ui-${SUFFIX}.html" 2>/dev/null || true
+else
+  fail "G1: UI fetch failed"
+fi
+_G1_PLAINTEXT_LEAK=0
+_i=0
+while [ "${_i}" -lt 6 ]; do
+  if PGSSLMODE=disable PGCONNECT_TIMEOUT=3 PGPASSWORD="${FRONTEND_PASSWORD}" psql -X -q -h 127.0.0.1 -p "${G1_PORT}" -U "${FRONTEND_USER}" -d "${TESTDB}" -tA -c "SELECT 1;" >/dev/null 2>&1; then
+    _G1_PLAINTEXT_LEAK=1
+    break
+  fi
+  sleep 3
+  _i=$((_i + 1))
+done
+if [ "${_G1_PLAINTEXT_LEAK}" = "0" ]; then
+  pass "G1: plaintext never succeeds while unverified (no window)"
+else
+  fail "G1: plaintext must never succeed while unverified"
+fi
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "pgpooler-g1-req-${SUFFIX}"; then
+  pass "G1: container stable during failed verifications"
+else
+  fail "G1: container should keep running (UI + watcher)"
+fi
+# Heal: next activation verifies the endpoint and publishes active.
+docker exec "pgpooler-g1-req-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-endpoint-verification 2>/dev/null || true
+if wait_tls_state "pgpooler-g1-req-${SUFFIX}" "active" 40; then
+  pass "G1: active published after verification succeeds"
+else
+  fail "G1: did not reach active after healing"
+fi
+_G1_SERVED=$(tls_fingerprint "${G1_PORT}" "localhost")
+_G1_EXPECTED=$(runtime_leaf_fp_now "pgpooler-g1-req-${SUFFIX}")
+if [ -n "${_G1_SERVED}" ] && [ "${_G1_SERVED}" = "${_G1_EXPECTED}" ]; then
+  pass "G1: endpoint serves expected certificate at active"
+else
+  fail "G1: served certificate must match runtime leaf at active"
+fi
+if wait_tls_require "${G1_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G1: TLS works after verified activation"
+else
+  fail "G1: TLS should work after verified activation"
+fi
+if tls_disable_connect "${G1_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  fail "G1: plaintext must be rejected"
+else
+  pass "G1: plaintext rejected (no window)"
+fi
+_G1_SRC=$(src_fp_in_container "pgpooler-g1-req-${SUFFIX}" "localhost")
+_G1_APPLIED_AFTER=$(read_applied_fp "pgpooler-g1-req-${SUFFIX}")
+if [ -n "${_G1_SRC}" ] && [ "${_G1_SRC}" = "${_G1_APPLIED_AFTER}" ]; then
+  pass "G1: applied committed only after verification"
+else
+  fail "G1: applied should equal source after verification"
+fi
+docker rm -f "pgpooler-g1-req-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test G2: SIGHUP delivered but TLS rejected keeps plaintext, then heals ---"
+TLS_G2_DIR="${TLS_BASE}/g2"
+TLS_G2_TREE="${TLS_BASE}/g2-tree"
+G2_PORT=16449
+G2_UI=18049
+mkdir -p "${TLS_G2_TREE}/live/localhost" 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_G2_DIR}"; then
+  pass "G2 cert generated (not yet installed)"
+else
+  fail "G2 cert generation failed"
+fi
+docker run -d --name "pgpooler-g2-prefer-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${G2_PORT}:6432" -p "127.0.0.1:${G2_UI}:8080" \
+  -v "${TLS_G2_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer "${G2_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G2: initial plaintext works"
+else
+  fail "G2: initial plaintext did not start"
+fi
+_G2_PID_BEFORE=$(docker exec "pgpooler-g2-prefer-${SUFFIX}" cat /run/pgbouncer/pgbouncer.pid 2>/dev/null || printf '')
+# Inject a TLS setting PgBouncer rejects at RELOAD while staying alive.
+docker exec "pgpooler-g2-prefer-${SUFFIX}" touch /run/pgbouncer/.fail-tls-protocols 2>/dev/null || true
+install_test_cert "${TLS_G2_DIR}" "${TLS_G2_TREE}" "localhost" || true
+sleep 13
+if docker logs "pgpooler-g2-prefer-${SUFFIX}" 2>&1 | grep -q "got SIGHUP"; then
+  pass "G2: SIGHUP was actually delivered"
+else
+  fail "G2: SIGHUP delivery not observed in logs"
+fi
+_G2_PID_AFTER=$(docker exec "pgpooler-g2-prefer-${SUFFIX}" cat /run/pgbouncer/pgbouncer.pid 2>/dev/null || printf '')
+if [ -n "${_G2_PID_BEFORE}" ] && [ "${_G2_PID_BEFORE}" = "${_G2_PID_AFTER}" ]; then
+  pass "G2: same PgBouncer process survived (no restart)"
+else
+  fail "G2: PgBouncer process must stay alive across rejected reload"
+fi
+if docker exec "pgpooler-g2-prefer-${SUFFIX}" kill -0 "${_G2_PID_AFTER}" 2>/dev/null; then
+  pass "G2: rejected reload keeps process alive"
+else
+  fail "G2: process should stay alive after rejected reload"
+fi
+if nc -z -w 3 127.0.0.1 "${G2_PORT}" >/dev/null 2>&1; then
+  pass "G2: TCP stays open after rejected reload"
+else
+  fail "G2: TCP should stay open after rejected reload"
+fi
+_G2_SERVED=$(tls_fingerprint "${G2_PORT}" "localhost")
+if [ -z "${_G2_SERVED}" ]; then
+  pass "G2: endpoint serves no new certificate (change not applied)"
+else
+  fail "G2: endpoint must not serve the new certificate"
+fi
+if assert_state_now "pgpooler-g2-prefer-${SUFFIX}" "plaintext"; then
+  pass "G2: state stays plaintext (not active)"
+else
+  fail "G2: state must remain plaintext after rejected reload"
+fi
+if fetch_ui "${G2_UI}" "/tmp/pgpooler-g2-ui-${SUFFIX}.html"; then
+  if grep -q "Available and required" "/tmp/pgpooler-g2-ui-${SUFFIX}.html" 2>/dev/null; then
+    fail "G2: UI must not claim active"
+  else
+    pass "G2: UI does not lie after rejected reload"
+  fi
+  rm -f "/tmp/pgpooler-g2-ui-${SUFFIX}.html" 2>/dev/null || true
+else
+  fail "G2: UI fetch failed"
+fi
+_G2_APPLIED=$(read_applied_fp "pgpooler-g2-prefer-${SUFFIX}")
+if [ -z "${_G2_APPLIED}" ]; then
+  pass "G2: applied fingerprint not advanced on rejected reload"
+else
+  fail "G2: applied must not advance on rejected reload"
+fi
+if try_connect "${G2_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G2: plaintext still served after rejected reload"
+else
+  fail "G2: plaintext should still work after rejected reload"
+fi
+# Heal: removing the flag rewrites a clean config; the retry verifies live.
+docker exec "pgpooler-g2-prefer-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-protocols 2>/dev/null || true
+if wait_tls_state "pgpooler-g2-prefer-${SUFFIX}" "active" 30; then
+  pass "G2: retry succeeds after fault removed"
+else
+  fail "G2: retry did not reach active"
+fi
+sleep 2
+_G2_SERVED_AFTER=$(tls_fingerprint "${G2_PORT}" "localhost")
+_G2_EXPECTED_AFTER=$(runtime_leaf_fp_now "pgpooler-g2-prefer-${SUFFIX}")
+if [ -n "${_G2_SERVED_AFTER}" ] && [ "${_G2_SERVED_AFTER}" = "${_G2_EXPECTED_AFTER}" ]; then
+  pass "G2: endpoint serves expected certificate after heal"
+else
+  fail "G2: served certificate must match after heal"
+fi
+if tls_disable_connect "${G2_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  fail "G2: plaintext must be rejected after heal"
+else
+  pass "G2: plaintext rejected after heal"
+fi
+if tls_require_connect "${G2_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G2: TLS works after heal"
+else
+  fail "G2: TLS should work after heal"
+fi
+docker rm -f "pgpooler-g2-prefer-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test G3: renewal reload rejected keeps serving A, then heals to B ---"
+TLS_G3A_DIR="${TLS_BASE}/g3a"
+TLS_G3B_DIR="${TLS_BASE}/g3b"
+TLS_G3_TREE="${TLS_BASE}/g3-tree"
+G3_PORT=16450
+G3_UI=18050
+if make_test_cert "localhost" "${TLS_G3A_DIR}" && install_test_cert "${TLS_G3A_DIR}" "${TLS_G3_TREE}" "localhost"; then
+  pass "G3 cert A installed"
+else
+  fail "G3 cert A setup failed"
+fi
+docker run -d --name "pgpooler-g3-renew-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${G3_PORT}:6432" -p "127.0.0.1:${G3_UI}:8080" \
+  -v "${TLS_G3_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_tls_state "pgpooler-g3-renew-${SUFFIX}" "active" 30; then
+  pass "G3: boot reaches verified active (cert A)"
+else
+  fail "G3: boot did not reach active"
+fi
+_G3_FP_A=$(tls_fingerprint "${G3_PORT}" "localhost")
+_G3_APPLIED_A=$(read_applied_fp "pgpooler-g3-renew-${SUFFIX}")
+# Reference hash of the live A pair, captured before B exists anywhere.
+_G3_RT_FILE_A=$(runtime_file_hash_now "pgpooler-g3-renew-${SUFFIX}")
+if [ -n "${_G3_FP_A}" ] && [ -n "${_G3_APPLIED_A}" ] && [ -n "${_G3_RT_FILE_A}" ]; then
+  pass "G3: cert A verified live with applied record"
+else
+  fail "G3: cert A should be live with applied record"
+fi
+_G3_PID_BEFORE=$(docker exec "pgpooler-g3-renew-${SUFFIX}" cat /run/pgbouncer/pgbouncer.pid 2>/dev/null || printf '')
+# Install fault: the installed key becomes unloadable, so the renewal
+# RELOAD is really rejected by PgBouncer while the process survives.
+docker exec "pgpooler-g3-renew-${SUFFIX}" touch /run/pgbouncer/.fail-tls-install 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_G3B_DIR}"; then
+  pass "G3 cert B generated"
+else
+  fail "G3 cert B generation failed"
+fi
+install_test_cert "${TLS_G3B_DIR}" "${TLS_G3_TREE}" "localhost" || true
+sleep 13
+if docker logs "pgpooler-g3-renew-${SUFFIX}" 2>&1 | grep -q "got SIGHUP"; then
+  pass "G3: SIGHUP was actually delivered for B"
+else
+  fail "G3: SIGHUP delivery not observed in logs"
+fi
+_G3_PID_AFTER=$(docker exec "pgpooler-g3-renew-${SUFFIX}" cat /run/pgbouncer/pgbouncer.pid 2>/dev/null || printf '')
+if [ -n "${_G3_PID_BEFORE}" ] && [ "${_G3_PID_BEFORE}" = "${_G3_PID_AFTER}" ]; then
+  pass "G3: same PgBouncer process survived rejected renewal"
+else
+  fail "G3: process must stay alive across rejected renewal"
+fi
+_G3_FP_STILL=$(tls_fingerprint "${G3_PORT}" "localhost")
+if [ -n "${_G3_FP_STILL}" ] && [ "${_G3_FP_STILL}" = "${_G3_FP_A}" ]; then
+  pass "G3: rejected renewal keeps serving A"
+else
+  fail "G3: endpoint must still serve A after rejected reload"
+fi
+_G3_APPLIED_STILL=$(read_applied_fp "pgpooler-g3-renew-${SUFFIX}")
+if [ "${_G3_APPLIED_STILL}" = "${_G3_APPLIED_A}" ]; then
+  pass "G3: applied remains A after rejected reload"
+else
+  fail "G3: applied must remain A after rejected reload"
+fi
+_G3_RT_NOW=$(runtime_file_hash_now "pgpooler-g3-renew-${SUFFIX}")
+# The failure path restores the A backup and then cleans the backup
+# files, so compare against the pre-B reference hash captured above.
+if [ -n "${_G3_RT_NOW}" ] && [ -n "${_G3_RT_FILE_A}" ] && [ "${_G3_RT_NOW}" = "${_G3_RT_FILE_A}" ]; then
+  pass "G3: runtime files restored to A consistently"
+else
+  fail "G3: runtime files should be restored to A (got '${_G3_RT_NOW}')"
+fi
+if assert_state_now "pgpooler-g3-renew-${SUFFIX}" "active"; then
+  pass "G3: state remains active after rejected reload"
+else
+  fail "G3: state must remain active after rejected reload"
+fi
+if tls_require_connect "${G3_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G3: TLS still works after rejected reload"
+else
+  fail "G3: TLS should still work after rejected reload"
+fi
+docker exec "pgpooler-g3-renew-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-install 2>/dev/null || true
+_G3_FP_B=""
+_tries=0
+while [ "${_tries}" -lt 30 ]; do
+  sleep 1
+  _G3_FP_B=$(tls_fingerprint "${G3_PORT}" "localhost")
+  if [ -n "${_G3_FP_B}" ] && [ "${_G3_FP_B}" != "${_G3_FP_A}" ]; then
+    break
+  fi
+  _tries=$((_tries + 1))
+done
+if [ -n "${_G3_FP_B}" ] && [ "${_G3_FP_B}" != "${_G3_FP_A}" ]; then
+  pass "G3: retry serves renewed cert B"
+else
+  fail "G3: retry did not serve cert B"
+fi
+_G3_RT_B=$(runtime_leaf_fp_now "pgpooler-g3-renew-${SUFFIX}")
+# Both helpers keep raw `openssl x509 -fingerprint` format, so strict
+# string equality proves the endpoint serves the runtime leaf.
+if [ -n "${_G3_FP_B}" ] && [ -n "${_G3_RT_B}" ] && [ "${_G3_FP_B}" = "${_G3_RT_B}" ]; then
+  pass "G3: served B matches runtime leaf"
+else
+  fail "G3: served B must match runtime leaf (got served='${_G3_FP_B}' runtime='${_G3_RT_B}')"
+fi
+_G3_SRC_B=$(src_fp_in_container "pgpooler-g3-renew-${SUFFIX}" "localhost")
+_G3_APPLIED_B=""
+_tries=0
+while [ "${_tries}" -lt 15 ]; do
+  _G3_APPLIED_B=$(read_applied_fp "pgpooler-g3-renew-${SUFFIX}")
+  if [ -n "${_G3_SRC_B}" ] && [ "${_G3_SRC_B}" = "${_G3_APPLIED_B}" ]; then
+    break
+  fi
+  sleep 1
+  _tries=$((_tries + 1))
+done
+if [ -n "${_G3_SRC_B}" ] && [ "${_G3_SRC_B}" = "${_G3_APPLIED_B}" ]; then
+  pass "G3: applied becomes B only after endpoint serves B"
+else
+  fail "G3: applied should equal source B after success"
+fi
+docker rm -f "pgpooler-g3-renew-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test G4: boot with cert goes prepared first, active only when verified ---"
+TLS_G4_DIR="${TLS_BASE}/g4"
+TLS_G4_TREE="${TLS_BASE}/g4-tree"
+G4_PORT=16451
+G4_UI=18051
+if make_test_cert "localhost" "${TLS_G4_DIR}" && install_test_cert "${TLS_G4_DIR}" "${TLS_G4_TREE}" "localhost"; then
+  pass "G4 cert installed before boot"
+else
+  fail "G4 cert setup failed"
+fi
+docker run -d --name "pgpooler-g4-boot-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${G4_PORT}:6432" -p "127.0.0.1:${G4_UI}:8080" \
+  -v "${TLS_G4_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=required -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+_G4_SAW_PREPARED=0
+_G4_REACHED_ACTIVE=0
+_G4_ACTIVE_CLEAN=0
+_i=0
+# State and applied fingerprint are snapshotted in a SINGLE docker exec:
+# two separate reads could straddle the publish sequence (state written
+# before the applied commit) and falsely observe prepared+applied-set.
+while [ "${_i}" -lt 80 ]; do
+  _snap=$(docker exec "pgpooler-g4-boot-${SUFFIX}" sh -c 'printf "STATE="; grep "^TLS_STATE=" /run/pgbouncer/pgpooler.state 2>/dev/null | cut -d= -f2-; printf "APPLIED="; tr -d "\n" < /run/pgbouncer/tls/.fingerprint 2>/dev/null; echo' 2>/dev/null || printf '')
+  _st=$(printf '%s' "${_snap}" | grep '^STATE=' | cut -d= -f2-)
+  _ap=$(printf '%s' "${_snap}" | grep '^APPLIED=' | cut -d= -f2-)
+  case "${_st}" in
+    prepared)
+      _G4_SAW_PREPARED=1
+      if [ -z "${_ap}" ]; then
+        : # applied correctly empty while prepared
+      else
+        fail "G4: applied must be empty while prepared"
+        break
+      fi
+      ;;
+    active)
+      _G4_REACHED_ACTIVE=1
+      # At the first active observation the endpoint must already serve
+      # the expected certificate: no unverified-active window allowed.
+      _G4_SERVED_NOW=$(tls_fingerprint "${G4_PORT}" "localhost")
+      _G4_EXPECTED_NOW=$(runtime_leaf_fp_now "pgpooler-g4-boot-${SUFFIX}")
+      if [ -n "${_G4_SERVED_NOW}" ] && [ "${_G4_SERVED_NOW}" = "${_G4_EXPECTED_NOW}" ]; then
+        _G4_ACTIVE_CLEAN=1
+      else
+        fail "G4: endpoint must serve expected cert at first active (got '${_G4_SERVED_NOW}')"
+      fi
+      break
+      ;;
+  esac
+  sleep 1
+  _i=$((_i + 1))
+done
+if [ "${_G4_SAW_PREPARED}" = "1" ]; then
+  pass "G4: boot publishes prepared before active"
+else
+  fail "G4: prepared was never observed at boot"
+fi
+if [ "${_G4_REACHED_ACTIVE}" = "1" ]; then
+  pass "G4: boot reaches active after verification"
+else
+  fail "G4: boot did not reach active"
+fi
+if [ "${_G4_ACTIVE_CLEAN}" = "1" ]; then
+  pass "G4: first active already serves expected certificate"
+else
+  fail "G4: active must imply verified endpoint"
+fi
+if tls_disable_connect "${G4_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  fail "G4: plaintext must be rejected"
+else
+  pass "G4: plaintext rejected (no window)"
+fi
+if tls_require_connect "${G4_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G4: first TLS connection succeeds"
+else
+  fail "G4: TLS should succeed"
+fi
+docker rm -f "pgpooler-g4-boot-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test G5: docker restart with generated automatic config ---"
+TLS_G5_DIR="${TLS_BASE}/g5"
+TLS_G5_TREE="${TLS_BASE}/g5-tree"
+G5_PORT=16452
+G5_UI=18052
+if make_test_cert "localhost" "${TLS_G5_DIR}" && install_test_cert "${TLS_G5_DIR}" "${TLS_G5_TREE}" "localhost"; then
+  pass "G5 cert installed"
+else
+  fail "G5 cert setup failed"
+fi
+docker run -d --name "pgpooler-g5-restart-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${G5_PORT}:6432" -p "127.0.0.1:${G5_UI}:8080" \
+  -v "${TLS_G5_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_tls_state "pgpooler-g5-restart-${SUFFIX}" "active" 30; then
+  pass "G5: initial active before restart"
+else
+  fail "G5: did not reach active before restart"
+fi
+if tls_require_connect "${G5_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G5: TLS works before restart"
+else
+  fail "G5: TLS should work before restart"
+fi
+_G5_ID_BEFORE=$(docker inspect "pgpooler-g5-restart-${SUFFIX}" --format '{{.Id}}' 2>/dev/null || printf '')
+# Anchor readiness on post-restart log lines: the state file survives
+# `docker restart` on the container filesystem, so a stale pre-restart
+# `active` must not count. A fresh boot regenerates the config and logs
+# a fresh endpoint verification.
+_G5_CFG_BEFORE=$(docker logs "pgpooler-g5-restart-${SUFFIX}" 2>&1 | grep -c "Creating pgbouncer config" || true)
+_G5_OK_BEFORE=$(docker logs "pgpooler-g5-restart-${SUFFIX}" 2>&1 | grep -c "Frontend TLS verified active" || true)
+docker restart "pgpooler-g5-restart-${SUFFIX}" >/dev/null 2>&1 || true
+_G5_BOOTED=0
+_tries=0
+while [ "${_tries}" -lt 60 ]; do
+  if [ "$(docker logs "pgpooler-g5-restart-${SUFFIX}" 2>&1 | grep -c "Creating pgbouncer config" || true)" -gt "${_G5_CFG_BEFORE}" ]; then
+    _G5_BOOTED=1
+    break
+  fi
+  sleep 1
+  _tries=$((_tries + 1))
+done
+if [ "${_G5_BOOTED}" = "1" ]; then
+  pass "G5: rebooted and regenerated config (marker accepted)"
+else
+  fail "G5: container did not reboot with config regeneration"
+fi
+_G5_VERIFIED=0
+_tries=0
+while [ "${_tries}" -lt 60 ]; do
+  if [ "$(docker logs "pgpooler-g5-restart-${SUFFIX}" 2>&1 | grep -c "Frontend TLS verified active" || true)" -gt "${_G5_OK_BEFORE}" ]; then
+    _G5_VERIFIED=1
+    break
+  fi
+  sleep 1
+  _tries=$((_tries + 1))
+done
+if [ "${_G5_VERIFIED}" = "1" ]; then
+  pass "G5: fresh endpoint verification after restart (not stale state)"
+else
+  fail "G5: no fresh endpoint verification after restart"
+fi
+if wait_tls_state "pgpooler-g5-restart-${SUFFIX}" "active" 30; then
+  pass "G5: same container returns to active after restart"
+else
+  fail "G5: container did not return to active after restart"
+  docker logs "pgpooler-g5-restart-${SUFFIX}" 2>&1 | tail -20 || true
+fi
+_G5_ID_AFTER=$(docker inspect "pgpooler-g5-restart-${SUFFIX}" --format '{{.Id}}' 2>/dev/null || printf '')
+if [ -n "${_G5_ID_BEFORE}" ] && [ "${_G5_ID_BEFORE}" = "${_G5_ID_AFTER}" ]; then
+  pass "G5: restart kept the same container"
+else
+  fail "G5: expected the same container after restart"
+fi
+if docker logs "pgpooler-g5-restart-${SUFFIX}" 2>&1 | grep -q "custom mounted config"; then
+  fail "G5: own generated config misclassified as custom"
+else
+  pass "G5: no custom-config false positive after restart"
+fi
+if tls_require_connect "${G5_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G5: TLS works after restart"
+else
+  fail "G5: TLS should work after restart"
+fi
+if tls_disable_connect "${G5_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  fail "G5: plaintext must stay rejected after restart"
+else
+  pass "G5: plaintext rejected after restart"
+fi
+_G5_SERVED_AFTER=$(tls_fingerprint "${G5_PORT}" "localhost")
+_G5_EXPECTED_AFTER=$(runtime_leaf_fp_now "pgpooler-g5-restart-${SUFFIX}")
+if [ -n "${_G5_SERVED_AFTER}" ] && [ "${_G5_SERVED_AFTER}" = "${_G5_EXPECTED_AFTER}" ]; then
+  pass "G5: expected certificate still served after restart"
+else
+  fail "G5: served certificate must match after restart"
+fi
+if fetch_ui "${G5_UI}" "/tmp/pgpooler-g5-ui-${SUFFIX}.html"; then
+  if grep -q "Available and required" "/tmp/pgpooler-g5-ui-${SUFFIX}.html" 2>/dev/null; then
+    pass "G5: UI correct after restart"
+  else
+    fail "G5: UI should report active after restart"
+  fi
+  rm -f "/tmp/pgpooler-g5-ui-${SUFFIX}.html" 2>/dev/null || true
+else
+  fail "G5: UI fetch failed after restart"
+fi
+docker rm -f "pgpooler-g5-restart-${SUFFIX}" >/dev/null 2>&1 || true
+# Restart variant without certificate: plaintext must recover cleanly.
+G5B_PORT=16453
+G5B_UI=18053
+docker run -d --name "pgpooler-g5b-restart-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${G5B_PORT}:6432" -p "127.0.0.1:${G5B_UI}:8080" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer "${G5B_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G5b: plaintext works before restart"
+else
+  fail "G5b: plaintext did not start"
+fi
+docker restart "pgpooler-g5b-restart-${SUFFIX}" >/dev/null 2>&1 || true
+if wait_pgbouncer "${G5B_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G5b: plaintext recovers after restart"
+else
+  fail "G5b: plaintext should recover after restart"
+  docker logs "pgpooler-g5b-restart-${SUFFIX}" 2>&1 | tail -10 || true
+fi
+if assert_state_now "pgpooler-g5b-restart-${SUFFIX}" "plaintext"; then
+  pass "G5b: state plaintext after restart"
+else
+  fail "G5b: state should be plaintext after restart"
+fi
+docker rm -f "pgpooler-g5b-restart-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Test G6: genuine custom config still detected, marker config accepted ---"
+TLS_G6_DIR="${TLS_BASE}/g6"
+TLS_G6_TREE="${TLS_BASE}/g6-tree"
+if make_test_cert "localhost" "${TLS_G6_DIR}" && install_test_cert "${TLS_G6_DIR}" "${TLS_G6_TREE}" "localhost"; then
+  pass "G6 cert staged"
+else
+  fail "G6 cert setup failed"
+fi
+printf '[pgbouncer]\nlisten_port = 6432\n' > "${TLS_BASE}/g6-custom.ini" 2>/dev/null || true
+if docker run --rm --name "pgpooler-g6-custom-${SUFFIX}" \
+  -v "${TLS_G6_TREE}:/caprover-letsencrypt:ro" \
+  -v "${TLS_BASE}/g6-custom.ini:/etc/pgbouncer/pgbouncer.ini:ro" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-g6-custom-${SUFFIX}.log 2>&1; then
+  fail "G6: genuine custom config with automatic TLS must fail"
+else
+  if grep -q "custom mounted config" /tmp/pgpooler-g6-custom-${SUFFIX}.log 2>/dev/null; then
+    pass "G6: genuine custom config still detected clearly"
+  else
+    fail "G6: custom config rejected without clear error"
+  fi
+fi
+mkdir -p "${TLS_BASE}/g6-marker-dir" 2>/dev/null || true
+printf '# Generated by PgPooler-Uma - do not edit inside the container\n[pgbouncer]\nlisten_port = 6432\n' > "${TLS_BASE}/g6-marker-dir/pgbouncer.ini" 2>/dev/null || true
+if docker run --rm --name "pgpooler-g6-marker-${SUFFIX}" \
+  -v "${TLS_G6_TREE}:/caprover-letsencrypt:ro" \
+  -v "${TLS_BASE}/g6-marker-dir:/etc/pgbouncer" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'grep -q "^# Generated by PgPooler-Uma" /etc/pgbouncer/pgbouncer.ini && grep -q "client_tls_sslmode = require" /etc/pgbouncer/pgbouncer.ini && grep -q "^testdb" /etc/pgbouncer/pgbouncer.ini && echo G6_MARKER_OK' \
+  >/tmp/pgpooler-g6-marker-${SUFFIX}.log 2>&1; then
+  if grep -q "G6_MARKER_OK" /tmp/pgpooler-g6-marker-${SUFFIX}.log 2>/dev/null; then
+    pass "G6: marker-owned config regenerated with automatic TLS"
+  else
+    fail "G6: marker-owned config should regenerate automatic TLS"
+  fi
+else
+  fail "G6: marker-owned config run failed"
+fi
+# A marker-owned single-file read-only mount cannot be regenerated in
+# place; automatic TLS must fail clearly rather than misbehave.
+printf '# Generated by PgPooler-Uma - do not edit inside the container\n[pgbouncer]\nlisten_port = 6432\n' > "${TLS_BASE}/g6-marker-ro.ini" 2>/dev/null || true
+if docker run --rm --name "pgpooler-g6-markerro-${SUFFIX}" \
+  -v "${TLS_G6_TREE}:/caprover-letsencrypt:ro" \
+  -v "${TLS_BASE}/g6-marker-ro.ini:/etc/pgbouncer/pgbouncer.ini:ro" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-g6-markerro-${SUFFIX}.log 2>&1; then
+  fail "G6: read-only marker mount with automatic TLS must fail"
+else
+  if grep -qi "custom mounted config\|cannot.*regenerat" /tmp/pgpooler-g6-markerro-${SUFFIX}.log 2>/dev/null; then
+    pass "G6: read-only marker mount fails clearly"
+  else
+    fail "G6: read-only marker mount rejected without clear error"
+  fi
+fi
+
+log "--- Test G7: renewal backup failure aborts before touching active pair ---"
+TLS_G7A_DIR="${TLS_BASE}/g7a"
+TLS_G7B_DIR="${TLS_BASE}/g7b"
+TLS_G7_TREE="${TLS_BASE}/g7-tree"
+G7_PORT=16454
+G7_UI=18054
+if make_test_cert "localhost" "${TLS_G7A_DIR}" && install_test_cert "${TLS_G7A_DIR}" "${TLS_G7_TREE}" "localhost"; then
+  pass "G7 cert A installed"
+else
+  fail "G7 cert A setup failed"
+fi
+docker run -d --name "pgpooler-g7-renew-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${G7_PORT}:6432" -p "127.0.0.1:${G7_UI}:8080" \
+  -v "${TLS_G7_TREE}:/caprover-letsencrypt:ro" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer -e PGPOOLER_TLS_POLL_INTERVAL=5 \
+  "${IMAGE}" >/dev/null
+if wait_tls_state "pgpooler-g7-renew-${SUFFIX}" "active" 30; then
+  pass "G7: boot reaches verified active (cert A)"
+else
+  fail "G7: boot did not reach active"
+fi
+_G7_RT_A=$(runtime_file_hash_now "pgpooler-g7-renew-${SUFFIX}")
+_G7_FP_A=$(tls_fingerprint "${G7_PORT}" "localhost")
+_G7_APPLIED_A=$(read_applied_fp "pgpooler-g7-renew-${SUFFIX}")
+if [ -n "${_G7_RT_A}" ] && [ -n "${_G7_FP_A}" ] && [ -n "${_G7_APPLIED_A}" ]; then
+  pass "G7: cert A live with recorded state"
+else
+  fail "G7: cert A should be live with recorded state"
+fi
+docker exec "pgpooler-g7-renew-${SUFFIX}" touch /run/pgbouncer/.fail-tls-backup 2>/dev/null || true
+if make_test_cert "localhost" "${TLS_G7B_DIR}"; then
+  pass "G7 cert B generated"
+else
+  fail "G7 cert B generation failed"
+fi
+install_test_cert "${TLS_G7B_DIR}" "${TLS_G7_TREE}" "localhost" || true
+sleep 13
+if [ "$(runtime_file_hash_now "pgpooler-g7-renew-${SUFFIX}")" = "${_G7_RT_A}" ]; then
+  pass "G7: backup failure leaves active pair untouched"
+else
+  fail "G7: runtime files must not change when backup fails"
+fi
+_G7_FP_STILL=$(tls_fingerprint "${G7_PORT}" "localhost")
+if [ -n "${_G7_FP_STILL}" ] && [ "${_G7_FP_STILL}" = "${_G7_FP_A}" ]; then
+  pass "G7: endpoint still serves A after backup failure"
+else
+  fail "G7: endpoint must still serve A after backup failure"
+fi
+if [ "$(read_applied_fp "pgpooler-g7-renew-${SUFFIX}")" = "${_G7_APPLIED_A}" ]; then
+  pass "G7: applied remains A after backup failure"
+else
+  fail "G7: applied must remain A after backup failure"
+fi
+if assert_state_now "pgpooler-g7-renew-${SUFFIX}" "active"; then
+  pass "G7: state remains active after backup failure"
+else
+  fail "G7: state must remain active after backup failure"
+fi
+if tls_require_connect "${G7_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}"; then
+  pass "G7: TLS still works after backup failure"
+else
+  fail "G7: TLS should still work after backup failure"
+fi
+docker exec "pgpooler-g7-renew-${SUFFIX}" rm -f /run/pgbouncer/.fail-tls-backup 2>/dev/null || true
+_G7_FP_B=""
+_tries=0
+while [ "${_tries}" -lt 30 ]; do
+  sleep 1
+  _G7_FP_B=$(tls_fingerprint "${G7_PORT}" "localhost")
+  if [ -n "${_G7_FP_B}" ] && [ "${_G7_FP_B}" != "${_G7_FP_A}" ]; then
+    break
+  fi
+  _tries=$((_tries + 1))
+done
+if [ -n "${_G7_FP_B}" ] && [ "${_G7_FP_B}" != "${_G7_FP_A}" ]; then
+  pass "G7: retry serves renewed cert B"
+else
+  fail "G7: retry did not serve cert B"
+fi
+_G7_SRC_B=$(src_fp_in_container "pgpooler-g7-renew-${SUFFIX}" "localhost")
+_G7_APPLIED_B=""
+_tries=0
+while [ "${_tries}" -lt 15 ]; do
+  _G7_APPLIED_B=$(read_applied_fp "pgpooler-g7-renew-${SUFFIX}")
+  if [ -n "${_G7_SRC_B}" ] && [ "${_G7_SRC_B}" = "${_G7_APPLIED_B}" ]; then
+    break
+  fi
+  sleep 1
+  _tries=$((_tries + 1))
+done
+if [ -n "${_G7_SRC_B}" ] && [ "${_G7_SRC_B}" = "${_G7_APPLIED_B}" ]; then
+  pass "G7: applied becomes B only after endpoint serves B"
+else
+  fail "G7: applied should equal source B after success"
+fi
+docker rm -f "pgpooler-g7-renew-${SUFFIX}" >/dev/null 2>&1 || true
 
 # Scrub TLS temp trees (may contain test keys; never committed).
 rm -rf "${TLS_BASE}" 2>/dev/null || true
