@@ -1,5 +1,5 @@
 #!/bin/sh
-# PgPooler-Uma healthcheck: no PostgreSQL authentication, no secrets.
+# PgPoolito healthcheck: no PostgreSQL authentication, no secrets.
 # Passes when the HTTP UI is reachable and, when PgBouncer is expected
 # to be running with a settled state, its TCP port accepts connections
 # (no login attempted).

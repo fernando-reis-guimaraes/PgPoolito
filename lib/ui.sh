@@ -1,5 +1,5 @@
 #!/bin/sh
-# PgPooler-Uma HTTP documentation UI helpers (POSIX sh).
+# PgPoolito HTTP documentation UI helpers (POSIX sh).
 # Generates a static informational page with no secrets, no login,
 # no database API, no credential submission, no JavaScript framework.
 # All displayed configuration values are HTML-escaped.
@@ -114,7 +114,7 @@ generate_ui_page() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PgPooler-Uma</title>
+<title>PgPoolito</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
 .wrap{max-width:720px;margin:0 auto;padding:32px 20px}
@@ -132,7 +132,7 @@ a{color:#7dd3fc}
 <body>
 <div class="wrap">
 <div class="card">
-<h1>PgPooler-Uma</h1>
+<h1>PgPoolito</h1>
 <p class="sub">PostgreSQL Connection Pooler</p>
 <div class="grid">
 <div class="k">Host</div>

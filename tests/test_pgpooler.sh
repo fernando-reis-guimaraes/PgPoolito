@@ -1,5 +1,5 @@
 #!/bin/sh
-# PgPooler-Uma integration + config tests.
+# PgPoolito integration + config tests.
 # Split mode isolates frontend auth (auth_file holds ONLY PGBOUNCER_USER)
 # from backend auth (native user=/password= in [databases]).
 # Legacy mode (no PGBOUNCER_*) remains upstream-compatible.
@@ -117,7 +117,7 @@ try_connect() {
   PGPASSWORD="${_p}" psql -X -q -h 127.0.0.1 -p "${_hp}" -U "${_u}" -d "${TESTDB}" -tA -c "SELECT 1;" >/dev/null 2>&1
 }
 
-log "=== PgPooler-Uma tests (image: ${IMAGE}) ==="
+log "=== PgPoolito tests (image: ${IMAGE}) ==="
 
 # ---------------------------------------------------------------- build
 log "--- Test 0: build image locally ---"
@@ -259,7 +259,7 @@ fi
 
 log "--- Test 5: same username is isolated (backend not in auth_file) ---"
 docker run --rm --name "pgpooler-sameuser-${SUFFIX}" \
-  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
   -e PGBOUNCER_USER="${BACKEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
   --entrypoint /entrypoint.sh "${IMAGE}" \
   sh -c 'test "$(grep -c "\"backend_user\"" /etc/pgbouncer/userlist.txt)" = "1" && echo SAMEUSER_OK' \
@@ -301,10 +301,192 @@ else
   fail "DATABASE_URLS split handling broken"
 fi
 
+log "--- Test R1: DATABASE_URL postgres mode emits wildcard ---"
+docker run --rm --name "pgpooler-r1-${SUFFIX}" \
+  -e "DATABASE_URL=postgresql://user:pass@db.example.com:5432/postgres" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'grep -E "^\* =" /etc/pgbouncer/pgbouncer.ini | grep -q "db.example.com" && grep -E "^\* =" /etc/pgbouncer/pgbouncer.ini | grep -q "port=5432" && ! grep -q "^postgres =" /etc/pgbouncer/pgbouncer.ini && ! grep -q "dbname=postgres" /etc/pgbouncer/pgbouncer.ini && echo R1_OK' \
+  >/tmp/pgpooler-r1-${SUFFIX}.log 2>&1 || true
+if grep -q "R1_OK" /tmp/pgpooler-r1-${SUFFIX}.log 2>/dev/null; then
+  pass "DATABASE_URL /postgres emits wildcard without dbname"
+else
+  fail "DATABASE_URL /postgres wildcard broken"
+fi
+
+log "--- Test R2: DB_* postgres mode emits wildcard ---"
+docker run --rm --name "pgpooler-r2-${SUFFIX}" \
+  -e DB_HOST=db.example.com -e DB_PORT=5432 -e DB_NAME=postgres -e DB_USER=user -e DB_PASSWORD=pass \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'grep -E "^\* =" /etc/pgbouncer/pgbouncer.ini | grep -q "db.example.com" && ! grep -q "^postgres =" /etc/pgbouncer/pgbouncer.ini && ! grep -q "dbname=postgres" /etc/pgbouncer/pgbouncer.ini && echo R2_OK' \
+  >/tmp/pgpooler-r2-${SUFFIX}.log 2>&1 || true
+if grep -q "R2_OK" /tmp/pgpooler-r2-${SUFFIX}.log 2>/dev/null; then
+  pass "DB_NAME=postgres emits wildcard without dbname"
+else
+  fail "DB_NAME=postgres wildcard broken"
+fi
+
+log "--- Test R2b: postgres wildcard legacy mode ---"
+docker run --rm --name "pgpooler-r2b-${SUFFIX}" \
+  -e DB_HOST=db.example.com -e DB_PORT=5432 -e DB_NAME=postgres -e DB_USER=user -e DB_PASSWORD=pass \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'grep -E "^\* =" /etc/pgbouncer/pgbouncer.ini | grep -q "auth_user=user" && ! grep -q "^postgres =" /etc/pgbouncer/pgbouncer.ini && echo R2B_OK' \
+  >/tmp/pgpooler-r2b-${SUFFIX}.log 2>&1 || true
+if grep -q "R2B_OK" /tmp/pgpooler-r2b-${SUFFIX}.log 2>/dev/null; then
+  pass "legacy DB_NAME=postgres emits wildcard"
+else
+  fail "legacy DB_NAME=postgres wildcard broken"
+fi
+
+log "--- Test R3: DATABASE_URL locked mode stays explicit ---"
+docker run --rm --name "pgpooler-r3-${SUFFIX}" \
+  -e "DATABASE_URL=postgresql://user:pass@db.example.com:5432/classlog" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'grep "^classlog" /etc/pgbouncer/pgbouncer.ini | grep -q "db.example.com" && ! grep -qE "^\* =" /etc/pgbouncer/pgbouncer.ini && echo R3_OK' \
+  >/tmp/pgpooler-r3-${SUFFIX}.log 2>&1 || true
+if grep -q "R3_OK" /tmp/pgpooler-r3-${SUFFIX}.log 2>/dev/null; then
+  pass "DATABASE_URL /classlog stays explicit without wildcard"
+else
+  fail "DATABASE_URL /classlog locked mode broken"
+fi
+
+log "--- Test R4: DB_* locked mode stays explicit ---"
+docker run --rm --name "pgpooler-r4-${SUFFIX}" \
+  -e DB_HOST=db.example.com -e DB_PORT=5432 -e DB_NAME=classlog -e DB_USER=user -e DB_PASSWORD=pass \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'grep "^classlog" /etc/pgbouncer/pgbouncer.ini | grep -q "db.example.com" && ! grep -qE "^\* =" /etc/pgbouncer/pgbouncer.ini && echo R4_OK' \
+  >/tmp/pgpooler-r4-${SUFFIX}.log 2>&1 || true
+if grep -q "R4_OK" /tmp/pgpooler-r4-${SUFFIX}.log 2>/dev/null; then
+  pass "DB_NAME=classlog stays explicit without wildcard"
+else
+  fail "DB_NAME=classlog locked mode broken"
+fi
+
+log "--- Test R5: fail-fast on missing/blank database ---"
+# R5a: DB_NAME unset (no DATABASE_URL).
+if docker run --rm --name "pgpooler-r5a-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-r5a-${SUFFIX}.log 2>&1; then
+  fail "missing DB_NAME should fail startup"
+else
+  if grep -qi "database name is required" /tmp/pgpooler-r5a-${SUFFIX}.log 2>/dev/null; then
+    pass "missing DB_NAME fails fast clearly"
+  else
+    fail "missing DB_NAME failed without clear error"
+  fi
+fi
+# R5b: DB_NAME empty.
+if docker run --rm --name "pgpooler-r5b-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="" \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-r5b-${SUFFIX}.log 2>&1; then
+  fail "empty DB_NAME should fail startup"
+else
+  if grep -qi "database name is required" /tmp/pgpooler-r5b-${SUFFIX}.log 2>/dev/null; then
+    pass "empty DB_NAME fails fast clearly"
+  else
+    fail "empty DB_NAME failed without clear error"
+  fi
+fi
+# R5c: DB_NAME whitespace-only.
+if docker run --rm --name "pgpooler-r5c-${SUFFIX}" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="   " \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-r5c-${SUFFIX}.log 2>&1; then
+  fail "whitespace-only DB_NAME should fail startup"
+else
+  if grep -qi "database name is required" /tmp/pgpooler-r5c-${SUFFIX}.log 2>/dev/null; then
+    pass "whitespace-only DB_NAME fails fast clearly"
+  else
+    fail "whitespace-only DB_NAME failed without clear error"
+  fi
+fi
+# R5d: DATABASE_URL without database path.
+if docker run --rm --name "pgpooler-r5d-${SUFFIX}" \
+  -e "DATABASE_URL=postgresql://user:pass@db.example.com:5432" \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-r5d-${SUFFIX}.log 2>&1; then
+  fail "DATABASE_URL without database should fail startup"
+else
+  if grep -qi "database name is required" /tmp/pgpooler-r5d-${SUFFIX}.log 2>/dev/null; then
+    pass "DATABASE_URL without database fails fast clearly"
+  else
+    fail "DATABASE_URL without database failed without clear error"
+  fi
+fi
+# R5e: DATABASE_URL trailing slash, no database.
+if docker run --rm --name "pgpooler-r5e-${SUFFIX}" \
+  -e "DATABASE_URL=postgresql://user:pass@db.example.com:5432/" \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-r5e-${SUFFIX}.log 2>&1; then
+  fail "DATABASE_URL trailing slash should fail startup"
+else
+  if grep -qi "database name is required" /tmp/pgpooler-r5e-${SUFFIX}.log 2>/dev/null; then
+    pass "DATABASE_URL trailing slash fails fast clearly"
+  else
+    fail "DATABASE_URL trailing slash failed without clear error"
+  fi
+fi
+# R5f: DATABASE_URL whitespace-only database.
+if docker run --rm --name "pgpooler-r5f-${SUFFIX}" \
+  -e "DATABASE_URL=postgresql://user:pass@db.example.com:5432/   " \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-r5f-${SUFFIX}.log 2>&1; then
+  fail "DATABASE_URL whitespace database should fail startup"
+else
+  if grep -qi "database name is required" /tmp/pgpooler-r5f-${SUFFIX}.log 2>/dev/null; then
+    pass "DATABASE_URL whitespace database fails fast clearly"
+  else
+    fail "DATABASE_URL whitespace database failed without clear error"
+  fi
+fi
+# R5g: DATABASE_URLS entry missing database.
+if docker run --rm --name "pgpooler-r5g-${SUFFIX}" \
+  -e "DATABASE_URLS=postgresql://foo:pass@fakehost/foo,postgresql://bar:pass@fakehost:5432" \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-r5g-${SUFFIX}.log 2>&1; then
+  fail "DATABASE_URLS entry without database should fail startup"
+else
+  if grep -qi "database name is required" /tmp/pgpooler-r5g-${SUFFIX}.log 2>/dev/null; then
+    pass "DATABASE_URLS entry without database fails fast clearly"
+  else
+    fail "DATABASE_URLS entry without database failed without clear error"
+  fi
+fi
+
+log "--- Test R6: DATABASE_URLS postgres entry stays explicit ---"
+docker run --rm --name "pgpooler-r6-${SUFFIX}" \
+  -e "DATABASE_URLS=postgresql://foo:pass1@server-a/foo,postgresql://u:pass2@server-b/postgres" \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  --entrypoint /entrypoint.sh "${IMAGE}" \
+  sh -c 'grep "^postgres" /etc/pgbouncer/pgbouncer.ini | grep -q "server-b" && ! grep -qE "^\* =" /etc/pgbouncer/pgbouncer.ini && echo R6_OK' \
+  >/tmp/pgpooler-r6-${SUFFIX}.log 2>&1 || true
+if grep -q "R6_OK" /tmp/pgpooler-r6-${SUFFIX}.log 2>/dev/null; then
+  pass "DATABASE_URLS postgres entry stays explicit (no wildcard transform)"
+else
+  fail "DATABASE_URLS postgres entry should not wildcard"
+fi
+
+log "--- Test R7: old marker is treated as custom (no legacy compat) ---"
+printf '# Generated by PgPooler-Uma - do not edit inside the container\n[pgbouncer]\nlisten_port = 6432\n' > "${TLS_BASE:-/tmp}/pgpooler-oldmarker-${SUFFIX}.ini" 2>/dev/null || true
+mkdir -p "/tmp/pgpooler-oldmarker-dir-${SUFFIX}" 2>/dev/null || true
+printf '# Generated by PgPooler-Uma - do not edit inside the container\n[pgbouncer]\nlisten_port = 6432\n' > "/tmp/pgpooler-oldmarker-dir-${SUFFIX}/pgbouncer.ini" 2>/dev/null || true
+if docker run --rm --name "pgpooler-r7-${SUFFIX}" \
+  -v "/tmp/pgpooler-oldmarker-dir-${SUFFIX}:/etc/pgbouncer" \
+  -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
+  -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer \
+  --entrypoint /entrypoint.sh "${IMAGE}" true >/tmp/pgpooler-r7-${SUFFIX}.log 2>&1; then
+  fail "old-marker config with automatic TLS should be treated as custom and fail"
+else
+  if grep -qi "custom mounted config" /tmp/pgpooler-r7-${SUFFIX}.log 2>/dev/null; then
+    pass "old marker treated as custom (no legacy compat)"
+  else
+    fail "old marker should be treated as custom without compat"
+  fi
+fi
+rm -rf "/tmp/pgpooler-oldmarker-dir-${SUFFIX}" "/tmp/pgpooler-oldmarker-${SUFFIX}.ini" 2>/dev/null || true
+
 log "--- Test 7c: AUTH_TYPE variants preserve frontend auth, isolate backend ---"
 for _at in md5 plain scram-sha-256; do
   if docker run --rm --name "pgpooler-authtype-${SUFFIX}" \
-    -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" \
+    -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
     -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
     -e AUTH_TYPE="${_at}" \
     --entrypoint /entrypoint.sh "${IMAGE}" \
@@ -689,6 +871,138 @@ else
 fi
 docker rm -f "pgpooler-frontspecial-live-${SUFFIX}" >/dev/null 2>&1 || true
 
+# ============================================ routing modes (live)
+# PgWeb regression: DB_NAME=postgres must route postgres/test_alpha/
+# test_beta through one endpoint; DB_NAME=test_alpha must lock.
+# Helpers take an explicit database (existing wait_pgbouncer/try_connect
+# hardcode TESTDB and are left untouched).
+wait_pgbouncer_db() {
+  _wp_hp="$1"; _wp_u="$2"; _wp_p="$3"; _wp_db="$4"
+  _wp_tries=0
+  while [ "${_wp_tries}" -lt 30 ]; do
+    if PGPASSWORD="${_wp_p}" psql -X -q -h 127.0.0.1 -p "${_wp_hp}" -U "${_wp_u}" -d "${_wp_db}" -tA -c "SELECT 1;" >/dev/null 2>&1; then
+      return 0
+    fi
+    _wp_tries=$((_wp_tries + 1))
+    sleep 1
+  done
+  return 1
+}
+query_current_db() {
+  _qc_hp="$1"; _qc_u="$2"; _qc_p="$3"; _qc_db="$4"
+  PGPASSWORD="${_qc_p}" psql -X -q -h 127.0.0.1 -p "${_qc_hp}" -U "${_qc_u}" -d "${_qc_db}" -tA -c "SELECT current_database();" 2>/dev/null
+}
+try_connect_db() {
+  _tc_hp="$1"; _tc_u="$2"; _tc_p="$3"; _tc_db="$4"
+  PGPASSWORD="${_tc_p}" psql -X -q -h 127.0.0.1 -p "${_tc_hp}" -U "${_tc_u}" -d "${_tc_db}" -tA -c "SELECT 1;" >/dev/null 2>&1
+}
+
+log "--- Routing live: create test_alpha/test_beta upstream ---"
+docker exec "${PG}" psql -U "${BACKEND_USER}" -d postgres -tA -c "SELECT 1 FROM pg_database WHERE datname='test_alpha';" 2>/dev/null | grep -q 1 || docker exec "${PG}" createdb -U "${BACKEND_USER}" test_alpha >/dev/null 2>&1 || docker exec "${PG}" psql -U "${BACKEND_USER}" -d postgres -c "CREATE DATABASE test_alpha;" >/dev/null 2>&1 || true
+docker exec "${PG}" psql -U "${BACKEND_USER}" -d postgres -tA -c "SELECT 1 FROM pg_database WHERE datname='test_beta';" 2>/dev/null | grep -q 1 || docker exec "${PG}" createdb -U "${BACKEND_USER}" test_beta >/dev/null 2>&1 || docker exec "${PG}" psql -U "${BACKEND_USER}" -d postgres -c "CREATE DATABASE test_beta;" >/dev/null 2>&1 || true
+if docker exec "${PG}" psql -U "${BACKEND_USER}" -d postgres -tA -c "SELECT datname FROM pg_database WHERE datname IN ('postgres','test_alpha','test_beta') ORDER BY 1;" 2>/dev/null | grep -q test_alpha; then
+  pass "upstream has postgres/test_alpha/test_beta"
+else
+  fail "upstream missing test_alpha/test_beta"
+fi
+
+log "--- Routing live postgres mode: one endpoint serves all DBs ---"
+ROUTE_ADMIN_PORT=16461
+docker run -d --name "pgpooler-route-admin-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${ROUTE_ADMIN_PORT}:6432" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME=postgres \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer_db "${ROUTE_ADMIN_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}" "postgres"; then
+  pass "postgres-mode endpoint ready via postgres"
+else
+  fail "postgres-mode endpoint did not become ready"
+  docker logs "pgpooler-route-admin-${SUFFIX}" 2>&1 | head -20 || true
+fi
+if docker exec "pgpooler-route-admin-${SUFFIX}" sh -c 'grep -qE "^\* =" /etc/pgbouncer/pgbouncer.ini && ! grep -q "^postgres =" /etc/pgbouncer/pgbouncer.ini' >/dev/null 2>&1; then
+  pass "postgres-mode config is wildcard without postgres entry"
+else
+  fail "postgres-mode config should be wildcard"
+fi
+_q_postgres="$(query_current_db "${ROUTE_ADMIN_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}" "postgres")"
+if [ "${_q_postgres}" = "postgres" ]; then
+  pass "postgres-mode postgres => SELECT current_database()=postgres"
+else
+  fail "postgres-mode postgres mismatch (got '${_q_postgres}')"
+fi
+_q_alpha="$(query_current_db "${ROUTE_ADMIN_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}" "test_alpha")"
+if [ "${_q_alpha}" = "test_alpha" ]; then
+  pass "postgres-mode test_alpha => SELECT current_database()=test_alpha"
+else
+  fail "postgres-mode test_alpha mismatch (got '${_q_alpha}')"
+fi
+_q_beta="$(query_current_db "${ROUTE_ADMIN_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}" "test_beta")"
+if [ "${_q_beta}" = "test_beta" ]; then
+  pass "postgres-mode test_beta => SELECT current_database()=test_beta"
+else
+  fail "postgres-mode test_beta mismatch (got '${_q_beta}')"
+fi
+log "--- Routing live postgres mode: backend auth still isolated ---"
+if try_connect_db "${ROUTE_ADMIN_PORT}" "${BACKEND_USER}" "${BACKEND_PASSWORD}" "test_alpha"; then
+  fail "postgres-mode backend creds must not authenticate as frontend"
+else
+  pass "postgres-mode backend creds REJECTed as frontend"
+fi
+
+log "--- Routing live postgres mode: missing DB fails upstream, not pgbouncer ---"
+if try_connect_db "${ROUTE_ADMIN_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}" "does_not_exist"; then
+  fail "does_not_exist should fail"
+else
+  _missing_err="$(PGPASSWORD="${FRONTEND_PASSWORD}" psql -X -q -h 127.0.0.1 -p "${ROUTE_ADMIN_PORT}" -U "${FRONTEND_USER}" -d "does_not_exist" -tA -c "SELECT 1;" 2>&1 || true)"
+  case "${_missing_err}" in
+    *"no such database"*)
+      fail "does_not_exist failed with pgbouncer no such database (wildcard broken)"
+      ;;
+    *)
+      pass "does_not_exist fails upstream, not with no such database"
+      ;;
+  esac
+fi
+docker rm -f "pgpooler-route-admin-${SUFFIX}" >/dev/null 2>&1 || true
+
+log "--- Routing live locked mode: test_alpha only ---"
+ROUTE_LOCKED_PORT=16462
+docker run -d --name "pgpooler-route-locked-${SUFFIX}" --network "${NET}" \
+  -p "127.0.0.1:${ROUTE_LOCKED_PORT}:6432" \
+  -e DB_HOST="${PG}" -e DB_PORT=5432 -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME=test_alpha \
+  -e PGBOUNCER_USER="${FRONTEND_USER}" -e PGBOUNCER_PASSWORD="${FRONTEND_PASSWORD}" \
+  -e LISTEN_PORT=6432 -e AUTH_TYPE=scram-sha-256 \
+  "${IMAGE}" >/dev/null
+if wait_pgbouncer_db "${ROUTE_LOCKED_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}" "test_alpha"; then
+  pass "locked-mode endpoint ready via test_alpha"
+else
+  fail "locked-mode endpoint did not become ready"
+  docker logs "pgpooler-route-locked-${SUFFIX}" 2>&1 | head -20 || true
+fi
+if docker exec "pgpooler-route-locked-${SUFFIX}" sh -c '! grep -qE "^\* =" /etc/pgbouncer/pgbouncer.ini && grep -q "^test_alpha" /etc/pgbouncer/pgbouncer.ini' >/dev/null 2>&1; then
+  pass "locked-mode config has no wildcard, explicit test_alpha only"
+else
+  fail "locked-mode config should have no wildcard"
+fi
+_q_locked="$(query_current_db "${ROUTE_LOCKED_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}" "test_alpha")"
+if [ "${_q_locked}" = "test_alpha" ]; then
+  pass "locked-mode test_alpha => success"
+else
+  fail "locked-mode test_alpha mismatch (got '${_q_locked}')"
+fi
+if try_connect_db "${ROUTE_LOCKED_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}" "postgres"; then
+  fail "locked-mode postgres should be rejected (bypass!)"
+else
+  pass "locked-mode postgres rejected (no bypass via /postgres)"
+fi
+if try_connect_db "${ROUTE_LOCKED_PORT}" "${FRONTEND_USER}" "${FRONTEND_PASSWORD}" "test_beta"; then
+  fail "locked-mode test_beta should be rejected"
+else
+  pass "locked-mode test_beta rejected"
+fi
+docker rm -f "pgpooler-route-locked-${SUFFIX}" >/dev/null 2>&1 || true
+
 # ================================================================ TLS/UI
 # CapRover-friendly frontend TLS (PGPOOLER_SSL_MODE) + HTTP docs UI.
 # All TLS tests use per-run temp CAs/certs (never committed, never printed).
@@ -771,7 +1085,7 @@ wait_ui() {
   _w_tries=0
   while [ "${_w_tries}" -lt 30 ]; do
     if fetch_ui "${_w_port}" "/tmp/pgpooler-uiwait-${SUFFIX}.tmp" 2>/dev/null; then
-      if grep -q "PgPooler-Uma" "/tmp/pgpooler-uiwait-${SUFFIX}.tmp" 2>/dev/null; then
+      if grep -q "PgPoolito" "/tmp/pgpooler-uiwait-${SUFFIX}.tmp" 2>/dev/null; then
         rm -f "/tmp/pgpooler-uiwait-${SUFFIX}.tmp" 2>/dev/null || true
         return 0
       fi
@@ -2756,14 +3070,14 @@ else
   fi
 fi
 mkdir -p "${TLS_BASE}/g6-marker-dir" 2>/dev/null || true
-printf '# Generated by PgPooler-Uma - do not edit inside the container\n[pgbouncer]\nlisten_port = 6432\n' > "${TLS_BASE}/g6-marker-dir/pgbouncer.ini" 2>/dev/null || true
+printf '# Generated by PgPoolito - do not edit inside the container\n[pgbouncer]\nlisten_port = 6432\n' > "${TLS_BASE}/g6-marker-dir/pgbouncer.ini" 2>/dev/null || true
 if docker run --rm --name "pgpooler-g6-marker-${SUFFIX}" \
   -v "${TLS_G6_TREE}:/caprover-letsencrypt:ro" \
   -v "${TLS_BASE}/g6-marker-dir:/etc/pgbouncer" \
   -e DB_HOST=fakehost -e DB_USER="${BACKEND_USER}" -e DB_PASSWORD="${BACKEND_PASSWORD}" -e DB_NAME="${TESTDB}" \
   -e PUBLIC_HOST=localhost -e PGPOOLER_SSL_MODE=prefer \
   --entrypoint /entrypoint.sh "${IMAGE}" \
-  sh -c 'grep -q "^# Generated by PgPooler-Uma" /etc/pgbouncer/pgbouncer.ini && grep -q "client_tls_sslmode = require" /etc/pgbouncer/pgbouncer.ini && grep -q "^testdb" /etc/pgbouncer/pgbouncer.ini && echo G6_MARKER_OK' \
+  sh -c 'grep -q "^# Generated by PgPoolito" /etc/pgbouncer/pgbouncer.ini && grep -q "client_tls_sslmode = require" /etc/pgbouncer/pgbouncer.ini && grep -q "^testdb" /etc/pgbouncer/pgbouncer.ini && echo G6_MARKER_OK' \
   >/tmp/pgpooler-g6-marker-${SUFFIX}.log 2>&1; then
   if grep -q "G6_MARKER_OK" /tmp/pgpooler-g6-marker-${SUFFIX}.log 2>/dev/null; then
     pass "G6: marker-owned config regenerated with automatic TLS"
@@ -2775,7 +3089,7 @@ else
 fi
 # A marker-owned single-file read-only mount cannot be regenerated in
 # place; automatic TLS must fail clearly rather than misbehave.
-printf '# Generated by PgPooler-Uma - do not edit inside the container\n[pgbouncer]\nlisten_port = 6432\n' > "${TLS_BASE}/g6-marker-ro.ini" 2>/dev/null || true
+printf '# Generated by PgPoolito - do not edit inside the container\n[pgbouncer]\nlisten_port = 6432\n' > "${TLS_BASE}/g6-marker-ro.ini" 2>/dev/null || true
 if docker run --rm --name "pgpooler-g6-markerro-${SUFFIX}" \
   -v "${TLS_G6_TREE}:/caprover-letsencrypt:ro" \
   -v "${TLS_BASE}/g6-marker-ro.ini:/etc/pgbouncer/pgbouncer.ini:ro" \
