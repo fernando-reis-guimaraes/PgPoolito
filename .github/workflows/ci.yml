@@ -1,0 +1,101 @@
+name: PgPoolito CI
+
+"on":
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pgpoolito-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: shell syntax and ShellCheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Shell syntax validation (sh -n)
+        run: |
+          sh -n entrypoint.sh
+          sh -n healthcheck.sh
+          sh -n lib/tls.sh
+          sh -n lib/ui.sh
+          sh -n tests/test_pgpooler.sh
+
+      - name: Ensure ShellCheck is available
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+
+      - name: Run ShellCheck (warnings and above)
+        run: |
+          shellcheck -S warning entrypoint.sh healthcheck.sh lib/tls.sh lib/ui.sh tests/test_pgpooler.sh
+
+  integration:
+    name: full Docker integration suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Docker availability sanity check
+        run: |
+          docker version
+          docker info
+
+      - name: Install test dependencies (psql client)
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+          psql --version
+          command -v openssl
+          command -v curl || command -v wget
+
+      # The canonical full suite: builds the image itself and runs real
+      # PostgreSQL + PgBouncer integration (routing, auth, TLS/UI matrix).
+      # Passwords are per-run random and never printed; the suite fails on
+      # any secret leak, so its own stdout and /tmp/pgpooler-*.log files are
+      # safe to keep as failure artifacts. Test CA/key material under
+      # /tmp/pgpooler-tls-* is deliberately excluded.
+      - name: Run full PgPoolito test suite
+        run: |
+          ./tests/test_pgpooler.sh
+
+      - name: Collect failure logs (no secrets by suite design)
+        if: failure()
+        run: |
+          mkdir -p ci-artifacts
+          for f in /tmp/pgpooler-*.log; do
+            [ -e "$f" ] || continue
+            case "$f" in
+              /tmp/pgpooler-tls-*) continue ;;
+            esac
+            cp "$f" ci-artifacts/ 2>/dev/null || true
+          done
+          ls -la ci-artifacts/ || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgpoolito-failure-logs
+          path: ci-artifacts/
+          if-no-files-found: warn
+          retention-days: 7
