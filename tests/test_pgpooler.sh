@@ -532,7 +532,8 @@ fi
 
 log "--- Test R9: genuine custom config needs no DB_NAME ---"
 mkdir -p "/tmp/pgpooler-custom-nodb-${SUFFIX}" 2>/dev/null || true
-printf '[databases]\ncustomdb = host=fakehost port=5432\n[pgbouncer]\nlisten_port = 6432\n' > "/tmp/pgpooler-custom-nodb-${SUFFIX}/pgbouncer.ini" 2>/dev/null || true
+printf '[databases]\ncustomdb = host=fakehost port=5432\n[pgbouncer]\nlisten_port = 6432\n' > "/tmp/pgpooler-custom-nodb-expected-${SUFFIX}.ini" 2>/dev/null || true
+cp "/tmp/pgpooler-custom-nodb-expected-${SUFFIX}.ini" "/tmp/pgpooler-custom-nodb-${SUFFIX}/pgbouncer.ini" 2>/dev/null || true
 if docker run --rm --name "pgpooler-r9-${SUFFIX}" \
   -v "/tmp/pgpooler-custom-nodb-${SUFFIX}:/etc/pgbouncer" \
   --entrypoint /entrypoint.sh "${IMAGE}" \
@@ -550,7 +551,12 @@ else
     fail "genuine custom config run failed"
   fi
 fi
-rm -rf "/tmp/pgpooler-custom-nodb-${SUFFIX}" 2>/dev/null || true
+if cmp -s "/tmp/pgpooler-custom-nodb-expected-${SUFFIX}.ini" "/tmp/pgpooler-custom-nodb-${SUFFIX}/pgbouncer.ini" 2>/dev/null; then
+  pass "genuine custom config byte-for-byte identical after run"
+else
+  fail "genuine custom config was modified (not byte-identical)"
+fi
+rm -rf "/tmp/pgpooler-custom-nodb-${SUFFIX}" "/tmp/pgpooler-custom-nodb-expected-${SUFFIX}.ini" 2>/dev/null || true
 
 log "--- Test 7c: AUTH_TYPE variants preserve frontend auth, isolate backend ---"
 for _at in md5 plain scram-sha-256; do
