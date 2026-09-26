@@ -556,7 +556,25 @@ fi
 if cmp -s "/tmp/pgpooler-custom-nodb-expected-${SUFFIX}.ini" "/tmp/pgpooler-custom-nodb-${SUFFIX}/pgbouncer.ini" 2>/dev/null; then
   pass "genuine custom config byte-for-byte identical after run"
 else
-  fail "genuine custom config was modified (not byte-identical)"
+  # The entrypoint restricts pgbouncer.ini to 0600 postgres-owned even for
+  # preserved custom files. Under Linux bind mounts the host user may lose
+  # read access, so a host-side cmp can fail with permission denied while
+  # the bytes are intact (the in-container R9_OK check above already passed).
+  # Re-verify byte identity from inside a container (root), portably.
+  if docker run --rm --name "pgpooler-r9-cmp-${SUFFIX}" \
+    -v "/tmp/pgpooler-custom-nodb-expected-${SUFFIX}.ini:/expected.ini:ro" \
+    -v "/tmp/pgpooler-custom-nodb-${SUFFIX}:/etc/pgbouncer:ro" \
+    --entrypoint /bin/sh "${IMAGE}" \
+    -c 'cmp -s /expected.ini /etc/pgbouncer/pgbouncer.ini && echo R9_CMP_OK' \
+    >/tmp/pgpooler-r9-cmp-${SUFFIX}.log 2>&1; then
+    if grep -q "R9_CMP_OK" /tmp/pgpooler-r9-cmp-${SUFFIX}.log 2>/dev/null; then
+      pass "genuine custom config byte-for-byte identical after run"
+    else
+      fail "genuine custom config was modified (not byte-identical)"
+    fi
+  else
+    fail "genuine custom config was modified (not byte-identical)"
+  fi
 fi
 rm -rf "/tmp/pgpooler-custom-nodb-${SUFFIX}" "/tmp/pgpooler-custom-nodb-expected-${SUFFIX}.ini" 2>/dev/null || true
 
@@ -2007,9 +2025,14 @@ if make_test_cert "localhost" "${TLS_MAN_DIR}"; then
   mkdir -p "${TLS_MAN_TREE}" 2>/dev/null || true
   cp "${TLS_MAN_DIR}/fullchain.pem" "${TLS_MAN_TREE}/manual.crt" 2>/dev/null || true
   cp "${TLS_MAN_DIR}/privkey.pem" "${TLS_MAN_TREE}/manual.key" 2>/dev/null || true
-  chmod 644 "${TLS_MAN_TREE}/manual.crt" 2>/dev/null || true
-  chmod 600 "${TLS_MAN_TREE}/manual.key" 2>/dev/null || true
-  chown postgres:postgres "${TLS_MAN_TREE}/manual.crt" "${TLS_MAN_TREE}/manual.key" 2>/dev/null || true
+  # Portability: manual fixtures are throwaway per-run test certs bind-mounted
+  # into the container, where PgBouncer reads them as the postgres user. They
+  # must stay world-readable: mode 600 (or a host-side chown) makes the key
+  # unreadable to container-postgres under Linux bind-mount uid mapping
+  # (macOS Docker Desktop masks this), so PgBouncer cannot load its TLS
+  # identity there. Product runtime copies under /run/pgbouncer/tls stay
+  # 0600 and are asserted separately.
+  chmod 644 "${TLS_MAN_TREE}/manual.crt" "${TLS_MAN_TREE}/manual.key" 2>/dev/null || true
   pass "manual TLS cert staged"
 else
   fail "manual cert generation failed"
@@ -2405,8 +2428,9 @@ if make_test_cert "localhost" "${TLS_F5_DIR}"; then
   mkdir -p "${TLS_F5_TREE}" 2>/dev/null || true
   cp "${TLS_F5_DIR}/fullchain.pem" "${TLS_F5_TREE}/manual.crt" 2>/dev/null || true
   cp "${TLS_F5_DIR}/privkey.pem" "${TLS_F5_TREE}/manual.key" 2>/dev/null || true
-  chmod 644 "${TLS_F5_TREE}/manual.crt" 2>/dev/null || true
-  chmod 600 "${TLS_F5_TREE}/manual.key" 2>/dev/null || true
+  # Portability: see P10 staging comment. Throwaway per-run certs must stay
+  # world-readable so container-postgres can load them via Linux bind mounts.
+  chmod 644 "${TLS_F5_TREE}/manual.crt" "${TLS_F5_TREE}/manual.key" 2>/dev/null || true
   pass "F5 manual cert staged"
 else
   fail "F5 manual cert generation failed"
