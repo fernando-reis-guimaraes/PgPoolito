@@ -1,5 +1,5 @@
 #!/bin/sh
-# PgPooler-Uma frontend TLS helpers (POSIX sh).
+# PgPoolito frontend TLS helpers (POSIX sh).
 # No secrets are printed. No eval. PUBLIC_HOST is treated as untrusted.
 # Requires: openssl CLI for validation.
 

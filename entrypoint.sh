@@ -10,7 +10,7 @@ PG_CONFIG_DIR=/etc/pgbouncer
 PG_CONFIG_FILE="${PG_CONFIG_DIR}/pgbouncer.ini"
 _AUTH_FILE="${AUTH_FILE:-$PG_CONFIG_DIR/userlist.txt}"
 
-# Load PgPooler-Uma TLS + UI helpers when present (container path first,
+# Load PgPoolito TLS + UI helpers when present (container path first,
 # then relative to this script for local execution). Never fail when the
 # helpers are absent in minimal test harnesses.
 if [ -f "/usr/local/lib/pgpooler/tls.sh" ]; then
@@ -34,7 +34,7 @@ elif [ -f "./lib/ui.sh" ]; then
   . "./lib/ui.sh"
 fi
 
-# PgPooler-Uma frontend TLS policy (CapRover-friendly).
+# PgPoolito frontend TLS policy (CapRover-friendly).
 # PGPOOLER_SSL_MODE controls automatic CapRover certificate discovery.
 # It is NOT PgBouncer native client_tls_sslmode. Our prefer means:
 # plaintext only while no valid certificate exists, require once one does.
@@ -264,7 +264,7 @@ if [ "$(id -u 2>/dev/null || printf '0')" = "0" ] && id postgres >/dev/null 2>&1
   chown postgres:postgres "${_AUTH_FILE}" 2>/dev/null || true
 fi
 
-# PgPooler-Uma extension: optional independent frontend credentials.
+# PgPoolito extension: optional independent frontend credentials.
 # PGBOUNCER_USER / PGBOUNCER_PASSWORD authenticate applications connecting
 # TO PgBouncer, while DB_USER / DB_PASSWORD are the credentials PgBouncer
 # uses FROM PgBouncer TO PostgreSQL via native `user=` / `password=`
@@ -303,6 +303,41 @@ if [ -n "${PGBOUNCER_PASSWORD:-}" ] && has_cr_or_lf "${PGBOUNCER_PASSWORD}"; the
   echo "error: PGBOUNCER_PASSWORD contains a newline or carriage return and cannot be represented safely in PgBouncer auth_file" >&2
   exit 1
 fi
+
+# True (0) when $1 is empty or whitespace-only; false when it contains at
+# least one non-whitespace byte. Check-only, no modification, no eval.
+# Never prints the value. POSIX /bin/sh compatible.
+is_blank_db_name() {
+  case "$1" in
+    "") return 0 ;;
+    *[![:space:]]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Fail fast when the effective database name is missing, whitespace-only,
+# or the reserved wildcard "*".
+# Args: value context-label (label never contains secrets).
+# The [databases] section is line-oriented, so blank or CR/LF-bearing keys
+# can never be represented safely. "*" is PgBouncer routing syntax, not an
+# acceptable configured database name: the only generated wildcard path is
+# effective DB exactly "postgres" in single-upstream mode. Legitimate names
+# (including those with embedded spaces) pass through byte-identical.
+# Never prints the value (except the literal reserved "*").
+require_valid_db_name() {
+  if is_blank_db_name "$1"; then
+    echo "error: database name is required and must not be empty or whitespace-only ($2); set DB_NAME or use DATABASE_URL ending in /<database>." >&2
+    exit 1
+  fi
+  if [ "$1" = "*" ]; then
+    echo "error: database name \"*\" is reserved for PgBouncer wildcard routing and must not be configured explicitly ($2); use DB_NAME=postgres for multi-database mode." >&2
+    exit 1
+  fi
+  if has_cr_or_lf "$1"; then
+    echo "error: database name contains a newline or carriage return and cannot be represented safely in pgbouncer.ini ($2)." >&2
+    exit 1
+  fi
+}
 
 # Extract all info from a given URL. Sets variables because shell functions can't return multiple values.
 #
@@ -467,7 +502,19 @@ ensure_frontend_auth() {
 # a frontend login (isolation breach). String-valued connstr parameters
 # (host/user/password) are single-quote serialized; port stays numeric.
 # Global AUTH_USER handling unchanged.
+# Routing policy (single-upstream only): effective DB exactly "postgres"
+# emits the wildcard "*" key (multi-database admin mode, no dbname, so the
+# client-requested database is used). Any other valid DB emits its explicit
+# name (locked mode, preserved byte-identical to upstream behavior).
+# DATABASE_URLS entries never wildcard: while DATABASE_URLS is set the
+# explicit name is always used. Callers must validate DB_NAME via
+# require_valid_db_name() before invoking; empty/whitespace-only must fail
+# fast and never reach this function.
 generate_config_db_entry() {
+  _db_key="${DB_NAME}"
+  if [ -z "${DATABASE_URLS:-}" ] && [ "${_db_key}" = "postgres" ]; then
+    _db_key="*"
+  fi
   if [ "${SPLIT_AUTH}" = "1" ]; then
     _q_host="$(quote_connstr_value "${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"}")"
     if [ -n "${DB_USER:-}" ]; then
@@ -481,13 +528,13 @@ generate_config_db_entry() {
       _backend_password=""
     fi
     printf "\
-${DB_NAME:-*} = host=${_q_host} \
+${_db_key} = host=${_q_host} \
 port=${DB_PORT:-5432}${_forced_user}${_backend_password}
 ${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
 " >> "${PG_CONFIG_FILE}"
   else
     printf "\
-${DB_NAME:-*} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} \
+${_db_key} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} \
 port=${DB_PORT:-5432} auth_user=${DB_USER:-postgres}
 ${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
 " >> "${PG_CONFIG_FILE}"
@@ -692,46 +739,20 @@ render_ui() {
 # Remember explicit DB_NAME before URL parsing overwrites it.
 _ORIG_DB_NAME="${DB_NAME:-}"
 
-# Write the password with MD5 encryption, to avoid printing it during startup.
-# Notice that `docker inspect` will show unencrypted env variables.
-# NOTE: comma-separated iteration runs in the main shell (no pipe subshell)
-# so that validation failures correctly abort startup.
-# In split mode backend users are NOT added to auth_file; only the
-# frontend credential is added once after parsing.
-if [ -n "${DATABASE_URLS:-}" ]; then
-  _urls_rest="${DATABASE_URLS},"
-  while [ -n "${_urls_rest}" ]; do
-    _cur_url="${_urls_rest%%,*}"
-    case "${_urls_rest}" in
-      *,*) _urls_rest="${_urls_rest#*,}" ;;
-      *) _urls_rest="" ;;
-    esac
-    if [ -z "${_cur_url}" ]; then
-      continue
-    fi
-    parse_url "${_cur_url}"
-    generate_userlist_if_needed
-  done
-  ensure_frontend_auth
-else
-  if [ -n "${DATABASE_URL:-}" ]; then
-    parse_url "${DATABASE_URL}"
-  fi
-  generate_userlist_if_needed
-  ensure_frontend_auth
-fi
-
-# Detect a pre-existing custom config before we generate one.
+# Detect a pre-existing custom config before we parse/validate databases.
 # A config carrying our generation marker is ours (e.g. left behind by a
 # normal `docker restart` of this same container filesystem) and is
 # regenerated deterministically below; only a file WITHOUT the marker
 # counts as a user custom/mounted config. A marker-owned file that cannot
 # be removed (e.g. a read-only single-file mount) cannot be regenerated,
 # so automatic TLS refuses it clearly instead of misbehaving.
-_GENERATED_MARKER="# Generated by PgPooler-Uma - do not edit inside the container"
+# This check runs before database-name validation so a genuine custom
+# config (which defines its own [databases] mappings) is never required
+# to provide DB_NAME for generated-routing logic.
+_GENERATED_MARKER="# Generated by PgPoolito - do not edit inside the container"
 _CUSTOM_CONFIG=0
 if [ -f "${PG_CONFIG_FILE}" ]; then
-  if grep -q '^# Generated by PgPooler-Uma' "${PG_CONFIG_FILE}" 2>/dev/null; then
+  if grep -q '^# Generated by PgPoolito' "${PG_CONFIG_FILE}" 2>/dev/null; then
     _CUSTOM_CONFIG=0
     rm -f "${PG_CONFIG_FILE}" 2>/dev/null || true
     if [ -f "${PG_CONFIG_FILE}" ]; then
@@ -748,6 +769,44 @@ fi
 if [ "${_CUSTOM_CONFIG}" = "1" ] && [ "${AUTO_TLS_CANDIDATE}" = "1" ]; then
   echo "error: automatic CapRover TLS (PUBLIC_HOST=${PUBLIC_HOST_SANITIZED}) requires the generated pgbouncer.ini; a custom mounted config is present. Remove the custom mount to use automatic TLS, or unset PUBLIC_HOST to use manual CLIENT_TLS_* settings." >&2
   exit 1
+fi
+
+# Write the password with MD5 encryption, to avoid printing it during startup.
+# Notice that `docker inspect` will show unencrypted env variables.
+# NOTE: comma-separated iteration runs in the main shell (no pipe subshell)
+# so that validation failures correctly abort startup.
+# In split mode backend users are NOT added to auth_file; only the
+# frontend credential is added once after parsing.
+# Database-name validation is mandatory only when PgPoolito will generate
+# its own [databases] entries (_CUSTOM_CONFIG=0). A genuine custom config
+# (_CUSTOM_CONFIG=1) defines its own mappings and must not fail here.
+if [ -n "${DATABASE_URLS:-}" ]; then
+  _urls_rest="${DATABASE_URLS},"
+  while [ -n "${_urls_rest}" ]; do
+    _cur_url="${_urls_rest%%,*}"
+    case "${_urls_rest}" in
+      *,*) _urls_rest="${_urls_rest#*,}" ;;
+      *) _urls_rest="" ;;
+    esac
+    if [ -z "${_cur_url}" ]; then
+      continue
+    fi
+    parse_url "${_cur_url}"
+    if [ "${_CUSTOM_CONFIG}" != "1" ]; then
+      require_valid_db_name "${DB_NAME:-}" "DATABASE_URLS entry"
+    fi
+    generate_userlist_if_needed
+  done
+  ensure_frontend_auth
+else
+  if [ -n "${DATABASE_URL:-}" ]; then
+    parse_url "${DATABASE_URL}"
+  fi
+  if [ "${_CUSTOM_CONFIG}" != "1" ]; then
+    require_valid_db_name "${DB_NAME:-}" "single-upstream DB_NAME/DATABASE_URL"
+  fi
+  generate_userlist_if_needed
+  ensure_frontend_auth
 fi
 
 # Initial automatic TLS bootstrap (privileged: reads read-only source tree,
@@ -866,12 +925,14 @@ if [ ! -f "${PG_CONFIG_FILE}" ]; then
         continue
       fi
       parse_url "${_cur_url}"
+      require_valid_db_name "${DB_NAME:-}" "DATABASE_URLS entry"
       generate_config_db_entry
     done
   else
     if [ -n "${DATABASE_URL:-}" ]; then
       parse_url "${DATABASE_URL}"
     fi
+    require_valid_db_name "${DB_NAME:-}" "single-upstream DB_NAME/DATABASE_URL"
     generate_config_db_entry
   fi
 
