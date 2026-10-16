@@ -849,3 +849,9 @@ And it allows temporary disconnecting the backend database (e.g. for restarts) w
 PAUSE;
 RESUME;
 ```
+
+## Licenses and attribution
+
+PgPoolito is based on [edoburu/docker-pgbouncer](https://github.com/edoburu/docker-pgbouncer), whose MIT license and original copyright notice are preserved in [LICENSE](LICENSE). The PgBouncer executable distributed in the image is separately licensed under the ISC license; its upstream copyright and permission notice are reproduced verbatim in [licenses/PGBOUNCER-COPYRIGHT](licenses/PGBOUNCER-COPYRIGHT) (source: [pgbouncer/pgbouncer](https://github.com/pgbouncer/pgbouncer/blob/master/COPYRIGHT)).
+
+The Dockerfile includes both notices in released images under `/usr/share/licenses/pgpoolito/`. The PgBouncer binary is compiled from the official release tarball selected by the Dockerfile's `VERSION` build argument (currently `1.25.2`); the corresponding upstream source is available from [PgBouncer releases](https://www.pgbouncer.org/downloads/). Other runtime components from Alpine retain their own separate licenses.
