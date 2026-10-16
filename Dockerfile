@@ -27,6 +27,8 @@ COPY lib/tls.sh /usr/local/lib/pgpooler/tls.sh
 COPY lib/ui.sh /usr/local/lib/pgpooler/ui.sh
 COPY healthcheck.sh /usr/local/bin/pgpooler-healthcheck.sh
 COPY --from=build /pgbouncer/pgbouncer /usr/bin
+COPY LICENSE /usr/share/licenses/pgpoolito/LICENSE
+COPY licenses/PGBOUNCER-COPYRIGHT /usr/share/licenses/pgpoolito/PGBOUNCER-COPYRIGHT
 COPY --from=build /pgbouncer/etc/pgbouncer.ini /etc/pgbouncer/pgbouncer.ini.example
 COPY --from=build /pgbouncer/etc/userlist.txt /etc/pgbouncer/userlist.txt.example
 RUN chmod +x /entrypoint.sh /usr/local/bin/pgpooler-healthcheck.sh
